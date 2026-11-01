@@ -139,7 +139,7 @@ class ProjectionService : Service() {
                 }
             }
 
-            val notification = createNotification("Activo en http://$currentServerIp:8080 y https://$currentServerIp:8443")
+            val notification = createNotification("Servidor activo en http://$currentServerIp:8080")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
             } else {

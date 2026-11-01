@@ -349,7 +349,7 @@ class MainActivity : AppCompatActivity() {
     private fun refreshNetworkInfo() {
         val iface = NetworkInterfaceHelper.getHotspotOrWifiIpAddress()
         val ip = iface?.ipAddress ?: "0.0.0.0"
-        urlText.text = "HTTP:  http://$ip:8080\nHTTPS: https://$ip:8443 (Seguro / GPU)"
+        urlText.text = "URL: http://$ip:8080"
     }
 
     private fun checkShizuku() {
