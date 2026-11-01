@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>TesAAuto Mirror - Tesla Client</title>
+  <script src="/jmuxer.min.js"></script>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: none;
+    }
+    body, html {
+      width: 100%;
+      height: 100%;
+      background-color: #0b0e14;
+      color: #e0e6ed;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    #header-bar {
+      height: 44px;
+      background: #141923;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      font-size: 14px;
+      border-bottom: 1px solid #232c3d;
+      z-index: 10;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .badge.connected {
+      background: rgba(46, 204, 113, 0.15);
+      color: #2ecc71;
+    }
+    .badge.disconnected {
+      background: rgba(231, 76, 60, 0.15);
+      color: #e74c3c;
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+    #viewport-container {
+      flex: 1;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      overflow: hidden;
+    }
+    #video-canvas, #video-player {
+      max-width: 100%;
+      max-height: 100%;
+      aspect-ratio: 16 / 9;
+      width: auto;
+      height: auto;
+      object-fit: contain;
+      cursor: crosshair;
+      background: #000;
+      box-shadow: 0 0 24px rgba(0,0,0,0.9);
+    }
+    #video-player {
+      display: none;
+    }
+    #overlay-message {
+      position: absolute;
+      text-align: center;
+      pointer-events: auto;
+      transition: opacity 0.3s ease;
+      background: rgba(11, 14, 20, 0.92);
+      padding: 28px 36px;
+      border-radius: 16px;
+      border: 1px solid #2b3548;
+      max-width: 90%;
+      z-index: 20;
+    }
+    #overlay-message h2 {
+      font-size: 22px;
+      margin-bottom: 10px;
+      color: #fff;
+    }
+    #overlay-message p {
+      font-size: 14px;
+      color: #8da2fb;
+      margin-bottom: 18px;
+      line-height: 1.5;
+    }
+    #stats {
+      font-family: monospace;
+      font-size: 13px;
+      color: #8da2fb;
+      display: flex;
+      gap: 16px;
+    }
+    /* Barra inferior estilo dock de Tesla */
+    #dock-bar {
+      height: 64px;
+      background: #141923;
+      border-top: 1px solid #232c3d;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 0 16px;
+      z-index: 10;
+      overflow-x: auto;
+    }
+    .dock-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #1e2638;
+      color: #e0e6ed;
+      border: 1px solid #2d3952;
+      border-radius: 10px;
+      padding: 10px 16px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.2s ease;
+    }
+    .dock-btn:hover {
+      background: #28344e;
+      border-color: #3498db;
+      transform: translateY(-2px);
+    }
+    .dock-btn:active {
+      transform: translateY(0);
+    }
+    .dock-btn.nav-action {
+      background: #2c3e50;
+      border-color: #4a627a;
+    }
+    .dock-icon {
+      font-size: 18px;
+    }
+    #toast {
+      position: fixed;
+      top: 60px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #2ecc71;
+      color: #fff;
+      padding: 10px 24px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s ease;
+      z-index: 100;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+    }
+    .ripple-dot {
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: rgba(52, 152, 219, 0.6);
+      transform: translate(-50%, -50%) scale(1);
+      animation: ripple 0.35s ease-out forwards;
+      pointer-events: none;
+      z-index: 30;
+    }
+    @keyframes ripple {
+      to {
+        transform: translate(-50%, -50%) scale(2.5);
+        opacity: 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="toast"></div>
+
+  <div id="header-bar">
+    <div style="font-weight: 700; letter-spacing: 0.5px;">TesAAuto <span style="color:#3498db;">Mirror</span></div>
+    <div id="stats">
+      <span>FPS: <strong id="fps-val">0</strong></span>
+      <span>RTT: <strong id="rtt-val">--</strong> ms</span>
+      <span>Decoder: <strong id="dec-mode">Detectando...</strong></span>
+    </div>
+    <div id="status-badge" class="badge disconnected">
+      <span class="dot"></span>
+      <span id="status-text">Desconectado</span>
+    </div>
+  </div>
+
+  <div id="viewport-container">
+    <canvas id="video-canvas" width="1280" height="720"></canvas>
+    <video id="video-player" width="1280" height="720" autoplay muted playsinline></video>
+    <div id="overlay-message">
+      <h2 id="overlay-title">Conectado con Éxito</h2>
+      <p id="overlay-subtitle">Pulsa una aplicación en la barra inferior para iniciar la proyección en la pantalla de Tesla.</p>
+      <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
+        <button class="dock-btn" style="background:#1E88E5;" onclick="launchApp('com.google.android.apps.maps', 'Google Maps')">🗺️ Google Maps</button>
+        <button class="dock-btn" style="background:#00B0FF;" onclick="launchApp('com.waze', 'Waze')">🚗 Waze</button>
+        <button class="dock-btn" style="background:#1DB954;" onclick="launchApp('com.spotify.music', 'Spotify')">🎵 Spotify</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="dock-bar">
+    <button class="dock-btn nav-action" onclick="sendKey(4)" title="Botón Atrás de Android">
+      <span class="dock-icon">🔙</span>
+      <span>Atrás</span>
+    </button>
+    <button class="dock-btn nav-action" onclick="goHome()" title="Botón Inicio / Dashboard de Tesla">
+      <span class="dock-icon">🏠</span>
+      <span>Inicio</span>
+    </button>
+    <button class="dock-btn" onclick="launchApp('com.waze', 'Waze')">
+      <span class="dock-icon">🚗</span>
+      <span>Waze</span>
+    </button>
+    <button class="dock-btn" onclick="launchApp('com.google.android.apps.maps', 'Google Maps')">
+      <span class="dock-icon">🗺️</span>
+      <span>Google Maps</span>
+    </button>
+    <button class="dock-btn" onclick="launchApp('com.spotify.music', 'Spotify')">
+      <span class="dock-icon">🎵</span>
+      <span>Spotify</span>
+    </button>
+    <button class="dock-btn" onclick="checkDiag()">
+      <span class="dock-icon">⚙️</span>
+      <span>Diagnóstico</span>
+    </button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('video-canvas');
+    const videoElem = document.getElementById('video-player');
+    const ctx = canvas.getContext('2d');
+    const statusBadge = document.getElementById('status-badge');
+    const statusText = document.getElementById('status-text');
+    const fpsVal = document.getElementById('fps-val');
+    const rttVal = document.getElementById('rtt-val');
+    const decMode = document.getElementById('dec-mode');
+    const overlay = document.getElementById('overlay-message');
+    const toast = document.getElementById('toast');
+    const container = document.getElementById('viewport-container');
+
+    let ws = null;
+    let reconnectTimer = null;
+    let frameCounter = 0;
+    let lastFpsTime = performance.now();
+    let pingStartTime = 0;
+    let videoDecoder = null;
+    let jmuxer = null;
+    let firstFrameReceived = false;
+
+    // Estado del puntero (ratón o táctil)
+    let isPointerDown = false;
+    let startNormX = 0, startNormY = 0, startPointerTime = 0;
+    let currentNormX = 0, currentNormY = 0;
+
+    function showToast(msg, duration = 3000) {
+      toast.textContent = msg;
+      toast.style.opacity = '1';
+      setTimeout(() => {
+        toast.style.opacity = '0';
+      }, duration);
+    }
+
+    async function launchApp(pkg, name) {
+      showToast(`Iniciando ${name} en pantalla...`);
+      try {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: 'launch', package: pkg }));
+        } else {
+          const resp = await fetch('/api/launch?pkg=' + encodeURIComponent(pkg));
+          const data = await resp.json();
+          console.log('[TesAAuto] Resultado de lanzamiento:', data);
+        }
+        showToast(`Lanzando ${name}...`);
+      } catch (e) {
+        console.error('[TesAAuto] Error en launchApp:', e);
+      }
+    }
+
+    async function sendKey(code) {
+      try {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: 'key', code: code }));
+        } else {
+          await fetch('/api/key?code=' + code);
+        }
+        showToast(code === 4 ? 'Atrás' : 'Inicio', 1200);
+      } catch (e) {
+        console.error('[TesAAuto] Error enviando tecla:', e);
+      }
+    }
+
+    function goHome() {
+      sendKey(3);
+      try {
+        fetch('/api/home');
+      } catch (e) {}
+    }
+
+    async function checkDiag() {
+      try {
+        const resp = await fetch('/api/status');
+        const data = await resp.json();
+        alert(
+          `Estado de TesAAuto:\n` +
+          `• Servidor Activo: ${data.serverRunning}\n` +
+          `• Display Secundario ID: ${data.displayId} (Activo: ${data.displayActive})\n` +
+          `• Shizuku ADB: ${data.shizukuAvailable ? 'Conectado' : 'No iniciado'}\n` +
+          `• Permiso Shizuku: ${data.shizukuPermission ? 'Autorizado' : 'Pendiente'}\n` +
+          `• Codificador Hardware: ${data.isEncoding ? 'Activo' : 'Inactivo'}`
+        );
+      } catch (e) {
+        alert('Error consultando diagnóstico: ' + e);
+      }
+    }
+
+    // Inicializar decodificador de video
+    function setupVideoDecoder() {
+      // 1. Prioridad: WebCodecs (Ultra baja latencia <20ms) si está disponible en contexto seguro
+      if (window.isSecureContext && 'VideoDecoder' in window) {
+        try {
+          videoDecoder = new VideoDecoder({
+            output: (videoFrame) => {
+              if (canvas.width !== videoFrame.displayWidth || canvas.height !== videoFrame.displayHeight) {
+                canvas.width = videoFrame.displayWidth;
+                canvas.height = videoFrame.displayHeight;
+              }
+              ctx.drawImage(videoFrame, 0, 0, canvas.width, canvas.height);
+              videoFrame.close();
+              onFrameRendered();
+            },
+            error: (err) => {
+              console.error('[TesAAuto] Error en VideoDecoder:', err);
+            }
+          });
+
+          videoDecoder.configure({
+            codec: 'avc1.42001f', // H.264 Baseline Profile Level 3.1
+            optimizeForLatency: true
+          });
+          decMode.textContent = 'WebCodecs GPU';
+          console.log('[TesAAuto] WebCodecs GPU activo');
+          return;
+        } catch (e) {
+          console.warn('[TesAAuto] Error inicializando WebCodecs, pasando a MSE:', e);
+        }
+      }
+
+      // 2. Fallback: JMuxer sobre MediaSource (MSE por hardware para HTTP y navegadores de escritorio)
+      if (typeof JMuxer !== 'undefined' && 'MediaSource' in window) {
+        try {
+          canvas.style.display = 'none';
+          videoElem.style.display = 'block';
+
+          jmuxer = new JMuxer({
+            node: 'video-player',
+            mode: 'video',
+            flushingTime: 0,
+            maxDelay: 200,
+            clearBuffer: true,
+            fps: 60,
+            debug: false,
+            onError: function(err) {
+              console.warn('[TesAAuto] JMuxer error:', err);
+            }
+          });
+          decMode.textContent = 'MSE Hardware (JMuxer)';
+          console.log('[TesAAuto] JMuxer MSE decoder activo');
+          return;
+        } catch (err) {
+          console.warn('[TesAAuto] Error inicializando JMuxer:', err);
+        }
+      }
+
+      decMode.textContent = 'Canvas Fallback';
+      console.warn('[TesAAuto] Modo Canvas Fallback activo');
+    }
+
+    function isNalKeyFrame(u8Array) {
+      const len = Math.min(u8Array.length - 4, 64);
+      for (let i = 0; i < len; i++) {
+        if (u8Array[i] === 0 && u8Array[i + 1] === 0) {
+          let nalByte = 0;
+          if (u8Array[i + 2] === 1) {
+            nalByte = u8Array[i + 3];
+          } else if (u8Array[i + 2] === 0 && u8Array[i + 3] === 1) {
+            nalByte = u8Array[i + 4];
+          }
+          if (nalByte !== 0) {
+            const nalType = nalByte & 0x1F;
+            if (nalType === 5 || nalType === 7 || nalType === 8) {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
+
+    function onFrameRendered() {
+      if (!firstFrameReceived) {
+        firstFrameReceived = true;
+        overlay.style.opacity = '0';
+        overlay.style.pointerEvents = 'none';
+      }
+      trackFps();
+    }
+
+    function trackFps() {
+      frameCounter++;
+      const now = performance.now();
+      if (now - lastFpsTime >= 1000) {
+        fpsVal.textContent = frameCounter;
+        frameCounter = 0;
+        lastFpsTime = now;
+      }
+    }
+
+    function drawIdleScreen() {
+      ctx.fillStyle = '#06080d';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.strokeStyle = '#161c28';
+      ctx.lineWidth = 1;
+      for (let x = 0; x < canvas.width; x += 80) {
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+      }
+      for (let y = 0; y < canvas.height; y += 80) {
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+      }
+    }
+    drawIdleScreen();
+
+    function connect() {
+      const loc = window.location;
+      const wsProto = (loc.protocol === 'https:') ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProto}//${loc.host}/ws`;
+
+      statusText.textContent = 'Conectando...';
+      statusBadge.className = 'badge disconnected';
+
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+          statusText.textContent = 'En Vivo';
+          statusBadge.className = 'badge connected';
+          console.log('[TesAAuto] WebSocket conectado');
+          startPingLoop();
+        };
+
+        ws.onmessage = (event) => {
+          if (typeof event.data === 'string') {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.type === 'pong') {
+                const rtt = Math.round(performance.now() - pingStartTime);
+                rttVal.textContent = rtt;
+              } else if (msg.type === 'info') {
+                if (msg.width && msg.height) {
+                  canvas.width = msg.width;
+                  canvas.height = msg.height;
+                  videoElem.width = msg.width;
+                  videoElem.height = msg.height;
+                }
+              }
+            } catch (e) {
+              console.warn('[TesAAuto] Error parseando JSON:', e);
+            }
+          } else if (event.data instanceof ArrayBuffer) {
+            const u8 = new Uint8Array(event.data);
+            if (videoDecoder && videoDecoder.state === 'configured') {
+              try {
+                const chunk = new EncodedVideoChunk({
+                  type: isNalKeyFrame(u8) ? 'key' : 'delta',
+                  timestamp: performance.now() * 1000,
+                  data: event.data
+                });
+                videoDecoder.decode(chunk);
+              } catch (decErr) {
+                console.error('[TesAAuto] Error decodificando WebCodecs:', decErr);
+              }
+            } else if (jmuxer) {
+              try {
+                jmuxer.feed({
+                  video: u8
+                });
+                onFrameRendered();
+              } catch (jmErr) {
+                console.error('[TesAAuto] Error en JMuxer feed:', jmErr);
+              }
+            } else {
+              onFrameRendered();
+            }
+          }
+        };
+
+        ws.onclose = () => {
+          statusText.textContent = 'Desconectado';
+          statusBadge.className = 'badge disconnected';
+          overlay.style.opacity = '1';
+          overlay.style.pointerEvents = 'auto';
+          document.getElementById('overlay-title').textContent = 'Conexión interrumpida';
+          document.getElementById('overlay-subtitle').textContent = 'Reintentando conexión automática en 2 segundos...';
+          scheduleReconnect();
+        };
+
+        ws.onerror = (err) => {
+          console.error('[TesAAuto] WebSocket error:', err);
+          ws.close();
+        };
+      } catch (err) {
+        console.error('[TesAAuto] Error conectando socket:', err);
+        scheduleReconnect();
+      }
+    }
+
+    function scheduleReconnect() {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, 2000);
+    }
+
+    function startPingLoop() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        pingStartTime = performance.now();
+        ws.send(JSON.stringify({ type: 'ping', t: Date.now() }));
+        setTimeout(startPingLoop, 3000);
+      }
+    }
+
+    // --- CAPTURA Y TRADUCCIÓN DE INTERACCIÓN TÁCTIL Y RATÓN ---
+    function getActiveSurface() {
+      return (jmuxer && videoElem.style.display !== 'none') ? videoElem : canvas;
+    }
+
+    function getNormalizedCoords(clientX, clientY) {
+      const surface = getActiveSurface();
+      const rect = surface.getBoundingClientRect();
+      const x = (clientX - rect.left) / rect.width;
+      const y = (clientY - rect.top) / rect.height;
+      return { x, y, rect };
+    }
+
+    function showRipple(clientX, clientY) {
+      const dot = document.createElement('div');
+      dot.className = 'ripple-dot';
+      dot.style.left = `${clientX}px`;
+      dot.style.top = `${clientY}px`;
+      document.body.appendChild(dot);
+      setTimeout(() => dot.remove(), 400);
+    }
+
+    function handlePointerDown(clientX, clientY) {
+      const { x, y } = getNormalizedCoords(clientX, clientY);
+      if (x < 0 || x > 1 || y < 0 || y > 1) return;
+
+      isPointerDown = true;
+      startNormX = x;
+      startNormY = y;
+      currentNormX = x;
+      currentNormY = y;
+      startPointerTime = Date.now();
+
+      showRipple(clientX, clientY);
+    }
+
+    function handlePointerMove(clientX, clientY) {
+      if (!isPointerDown) return;
+      const { x, y } = getNormalizedCoords(clientX, clientY);
+      currentNormX = x;
+      currentNormY = y;
+    }
+
+    function handlePointerUp(clientX, clientY) {
+      if (!isPointerDown) return;
+      isPointerDown = false;
+
+      const { x, y } = getNormalizedCoords(clientX, clientY);
+      const dx = Math.abs(x - startNormX);
+      const dy = Math.abs(y - startNormY);
+      const duration = Date.now() - startPointerTime;
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        if (dx < 0.03 && dy < 0.03) {
+          // Tap preciso e instantáneo
+          ws.send(JSON.stringify({
+            action: 'tap',
+            x: Number(startNormX.toFixed(4)),
+            y: Number(startNormY.toFixed(4))
+          }));
+        } else {
+          // Gesto de deslizamiento / scroll (Swipe)
+          ws.send(JSON.stringify({
+            action: 'swipe',
+            x1: Number(startNormX.toFixed(4)),
+            y1: Number(startNormY.toFixed(4)),
+            x2: Number(x.toFixed(4)),
+            y2: Number(y.toFixed(4)),
+            duration: Math.min(Math.max(duration, 100), 800)
+          }));
+        }
+      }
+    }
+
+    // Eventos táctiles
+    container.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      if (e.touches.length > 0) {
+        const t = e.touches[0];
+        handlePointerDown(t.clientX, t.clientY);
+      }
+    }, { passive: false });
+
+    container.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      if (e.touches.length > 0) {
+        const t = e.touches[0];
+        handlePointerMove(t.clientX, t.clientY);
+      }
+    }, { passive: false });
+
+    container.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      if (e.changedTouches.length > 0) {
+        const t = e.changedTouches[0];
+        handlePointerUp(t.clientX, t.clientY);
+      }
+    }, { passive: false });
+
+    container.addEventListener('touchcancel', (e) => {
+      isPointerDown = false;
+    }, { passive: false });
+
+    // Eventos de ratón
+    container.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      handlePointerDown(e.clientX, e.clientY);
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (isPointerDown) {
+        handlePointerMove(e.clientX, e.clientY);
+      }
+    });
+
+    window.addEventListener('mouseup', (e) => {
+      if (isPointerDown) {
+        handlePointerUp(e.clientX, e.clientY);
+      }
+    });
+
+    window.addEventListener('DOMContentLoaded', () => {
+      setupVideoDecoder();
+      connect();
+    });
+  </script>
+</body>
+</html>
