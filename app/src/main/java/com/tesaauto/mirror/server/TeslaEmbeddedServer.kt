@@ -1,6 +1,7 @@
 package com.tesaauto.mirror.server
 
 import android.content.Context
+import android.util.Log
 import io.ktor.http.ContentType
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpMethod
@@ -8,6 +9,9 @@ import io.ktor.server.application.call
 import io.ktor.server.application.install
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.ApplicationEngine
+import io.ktor.server.engine.applicationEngineEnvironment
+import io.ktor.server.engine.connector
+import io.ktor.server.engine.sslConnector
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.cors.routing.CORS
 import io.ktor.server.response.respondBytes
@@ -23,21 +27,25 @@ import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.readText
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.security.KeyStore
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 
 class TeslaEmbeddedServer(
     private val context: Context,
     private val host: String = "0.0.0.0",
-    private val port: Int = 8080,
+    val port: Int = 8080,
+    val sslPort: Int = 8443,
     private val onClientConnected: (() -> Unit)? = null,
     private val onTouchEventReceived: ((String, Double, Double, Long) -> Unit)? = null
 ) {
+    companion object {
+        private const val TAG = "TeslaEmbeddedServer"
+    }
+
     var onLaunchAppRequest: ((String) -> Boolean)? = null
     var onGetStatusRequest: (() -> JSONObject)? = null
     var onTapRequest: ((Double, Double) -> Unit)? = null
@@ -66,136 +74,182 @@ class TeslaEmbeddedServer(
     var isRunning: Boolean = false
         private set
 
+    @Volatile
+    var isTlsActive: Boolean = false
+        private set
+
+    private fun loadKeyStore(): KeyStore? {
+        return try {
+            val ks = KeyStore.getInstance("PKCS12")
+            context.assets.open("keystore/tesaauto.p12").use { input ->
+                ks.load(input, "tesaautopassword".toCharArray())
+            }
+            Log.i(TAG, "Keystore TLS PKCS12 cargado con éxito para HTTPS")
+            ks
+        } catch (e: Exception) {
+            Log.w(TAG, "No se pudo cargar keystore TLS: ${e.message}. El servidor solo operará en HTTP.")
+            null
+        }
+    }
+
     fun start() {
         if (isRunning) return
 
-        serverEngine = embeddedServer(CIO, port = port, host = host) {
-            install(WebSockets) {
-                pingPeriod = Duration.ofSeconds(15)
-                timeout = Duration.ofSeconds(30)
-                maxFrameSize = Long.MAX_VALUE
-                masking = false
+        val keyStore = loadKeyStore()
+        isTlsActive = (keyStore != null)
+
+        val env = applicationEngineEnvironment {
+            // Conector HTTP estándar
+            connector {
+                this.host = this@TeslaEmbeddedServer.host
+                this.port = this@TeslaEmbeddedServer.port
             }
 
-            install(CORS) {
-                anyHost()
-                allowHeader(HttpHeaders.ContentType)
-                allowHeader(HttpHeaders.Authorization)
-                allowMethod(HttpMethod.Options)
-                allowMethod(HttpMethod.Get)
-                allowMethod(HttpMethod.Post)
+            // Conector HTTPS seguro (TLS)
+            if (keyStore != null) {
+                sslConnector(
+                    keyStore = keyStore,
+                    keyAlias = "tesaauto",
+                    keyStorePassword = { "tesaautopassword".toCharArray() },
+                    privateKeyPassword = { "tesaautopassword".toCharArray() }
+                ) {
+                    this.host = this@TeslaEmbeddedServer.host
+                    this.port = this@TeslaEmbeddedServer.sslPort
+                }
             }
 
-            routing {
-                // Servir cliente web principal para el navegador Chromium de Tesla
-                get("/") {
-                    val htmlContent = loadAssetFile("web/index.html")
-                    if (htmlContent != null) {
-                        call.respondBytes(htmlContent, ContentType.Text.Html)
-                    } else {
-                        call.respondText(
-                            "<!DOCTYPE html><html><body><h2>TesAAuto Server Active</h2><p>Assets no encontrados.</p></body></html>",
-                            ContentType.Text.Html
-                        )
-                    }
+            module {
+                install(WebSockets) {
+                    pingPeriod = Duration.ofSeconds(15)
+                    timeout = Duration.ofSeconds(30)
+                    maxFrameSize = Long.MAX_VALUE
+                    masking = false
                 }
 
-                get("/jmuxer.min.js") {
-                    val jsContent = loadAssetFile("web/jmuxer.min.js")
-                    if (jsContent != null) {
-                        call.respondBytes(jsContent, ContentType.Application.JavaScript)
-                    } else {
-                        call.respondText("Not Found", status = io.ktor.http.HttpStatusCode.NotFound)
-                    }
+                install(CORS) {
+                    anyHost()
+                    allowHeader(HttpHeaders.ContentType)
+                    allowHeader(HttpHeaders.Authorization)
+                    allowMethod(HttpMethod.Options)
+                    allowMethod(HttpMethod.Get)
+                    allowMethod(HttpMethod.Post)
                 }
 
-                // Endpoint de diagnóstico de salud
-                get("/status") {
-                    val statusJson = JSONObject().apply {
-                        put("status", "running")
-                        put("activeClients", activeSessions.size)
-                        put("port", port)
-                        put("timestamp", System.currentTimeMillis())
-                    }
-                    call.respondText(statusJson.toString(), ContentType.Application.Json)
-                }
-
-                // Endpoint de diagnóstico interno detallado
-                get("/api/status") {
-                    val status = onGetStatusRequest?.invoke() ?: JSONObject().apply {
-                        put("status", "running")
-                    }
-                    call.respondText(status.toString(), ContentType.Application.Json)
-                }
-
-                // Endpoint para lanzar aplicaciones en la pantalla del vehículo directamente desde la web
-                get("/api/launch") {
-                    val pkg = call.parameters["pkg"] ?: "com.google.android.apps.maps"
-                    val success = safeLaunchApp(pkg)
-                    val resJson = JSONObject().apply {
-                        put("package", pkg)
-                        put("success", success)
-                    }
-                    call.respondText(resJson.toString(), ContentType.Application.Json)
-                }
-
-                // Endpoint para simular teclas de sistema (ej. Back = 4, Home = 3)
-                get("/api/key") {
-                    val code = call.parameters["code"]?.toIntOrNull() ?: 4
-                    onKeyRequest?.invoke(code)
-                    call.respondText(JSONObject().apply { put("key", code) }.toString(), ContentType.Application.Json)
-                }
-
-                // Endpoint para volver a la pantalla de reloj / dashboard
-                get("/api/home") {
-                    onHomeRequest?.invoke()
-                    call.respondText(JSONObject().apply { put("home", true) }.toString(), ContentType.Application.Json)
-                }
-
-                // Canal WebSocket bidireccional
-                webSocket("/ws") {
-                    activeSessions.add(this)
-
-                    try {
-                        // Enviar información inicial de display al cliente
-                        val infoJson = JSONObject().apply {
-                            put("type", "info")
-                            put("width", 1280)
-                            put("height", 720)
-                            put("codec", "h264")
+                routing {
+                    // Servir cliente web principal para el navegador Chromium de Tesla
+                    get("/") {
+                        val htmlContent = loadAssetFile("web/index.html")
+                        if (htmlContent != null) {
+                            call.respondBytes(htmlContent, ContentType.Text.Html)
+                        } else {
+                            call.respondText(
+                                "<!DOCTYPE html><html><body><h2>TesAAuto Server Active</h2><p>Assets no encontrados.</p></body></html>",
+                                ContentType.Text.Html
+                            )
                         }
-                        send(Frame.Text(infoJson.toString()))
+                    }
 
-                        // Enviar SPS/PPS inicial de inmediato si ya está disponible en caché para inicializar decodificador
-                        getInitialConfigFrame?.invoke()?.let { spsPps ->
-                            send(Frame.Binary(true, spsPps))
+                    get("/jmuxer.min.js") {
+                        val jsContent = loadAssetFile("web/jmuxer.min.js")
+                        if (jsContent != null) {
+                            call.respondBytes(jsContent, ContentType.Application.JavaScript)
+                        } else {
+                            call.respondText("Not Found", status = io.ktor.http.HttpStatusCode.NotFound)
                         }
+                    }
 
-                        onClientConnected?.invoke()
+                    // Endpoint de diagnóstico de salud
+                    get("/status") {
+                        val statusJson = JSONObject().apply {
+                            put("status", "running")
+                            put("activeClients", activeSessions.size)
+                            put("httpPort", port)
+                            put("httpsPort", if (isTlsActive) sslPort else null)
+                            put("tlsActive", isTlsActive)
+                            put("timestamp", System.currentTimeMillis())
+                        }
+                        call.respondText(statusJson.toString(), ContentType.Application.Json)
+                    }
 
-                        // Escuchar mensajes entrantes (eventos táctiles y pings)
-                        for (frame in incoming) {
-                            when (frame) {
-                                is Frame.Text -> {
-                                    val text = frame.readText()
-                                    handleIncomingTextPayload(text, this)
-                                }
-                                is Frame.Binary -> {
-                                    // Payloads binarios del cliente si aplica
-                                }
-                                else -> Unit
+                    // Endpoint de diagnóstico interno detallado
+                    get("/api/status") {
+                        val status = onGetStatusRequest?.invoke() ?: JSONObject().apply {
+                            put("status", "running")
+                        }
+                        call.respondText(status.toString(), ContentType.Application.Json)
+                    }
+
+                    // Endpoint para lanzar aplicaciones en la pantalla del vehículo directamente desde la web
+                    get("/api/launch") {
+                        val pkg = call.parameters["pkg"] ?: "com.google.android.apps.maps"
+                        val success = safeLaunchApp(pkg)
+                        val resJson = JSONObject().apply {
+                            put("package", pkg)
+                            put("success", success)
+                        }
+                        call.respondText(resJson.toString(), ContentType.Application.Json)
+                    }
+
+                    // Endpoint para simular teclas de sistema (ej. Back = 4, Home = 3)
+                    get("/api/key") {
+                        val code = call.parameters["code"]?.toIntOrNull() ?: 4
+                        onKeyRequest?.invoke(code)
+                        call.respondText(JSONObject().apply { put("key", code) }.toString(), ContentType.Application.Json)
+                    }
+
+                    // Endpoint para volver a la pantalla de reloj / dashboard
+                    get("/api/home") {
+                        onHomeRequest?.invoke()
+                        call.respondText(JSONObject().apply { put("home", true) }.toString(), ContentType.Application.Json)
+                    }
+
+                    // Canal WebSocket bidireccional (funciona tanto para ws:// como para wss://)
+                    webSocket("/ws") {
+                        activeSessions.add(this)
+
+                        try {
+                            // Enviar información inicial de display al cliente
+                            val infoJson = JSONObject().apply {
+                                put("type", "info")
+                                put("width", 1280)
+                                put("height", 720)
+                                put("codec", "h264")
                             }
+                            send(Frame.Text(infoJson.toString()))
+
+                            // Enviar SPS/PPS inicial de inmediato si ya está disponible en caché para inicializar decodificador
+                            getInitialConfigFrame?.invoke()?.let { spsPps ->
+                                send(Frame.Binary(true, spsPps))
+                            }
+
+                            onClientConnected?.invoke()
+
+                            // Escuchar mensajes entrantes (eventos táctiles y pings)
+                            for (frame in incoming) {
+                                when (frame) {
+                                    is Frame.Text -> {
+                                        val text = frame.readText()
+                                        handleIncomingTextPayload(text, this)
+                                    }
+                                    is Frame.Binary -> {
+                                        // Payloads binarios del cliente si aplica
+                                    }
+                                    else -> Unit
+                                }
+                            }
+                        } catch (e: Exception) {
+                            // Desconexión o error de socket
+                        } finally {
+                            activeSessions.remove(this)
                         }
-                    } catch (e: Exception) {
-                        // Desconexión o error de socket
-                    } finally {
-                        activeSessions.remove(this)
                     }
                 }
             }
-        }.start(wait = false)
+        }
 
+        serverEngine = embeddedServer(CIO, env).start(wait = false)
         isRunning = true
+        Log.i(TAG, "TeslaEmbeddedServer iniciado: HTTP en puerto $port, HTTPS en puerto ${if (isTlsActive) sslPort.toString() else "inactivo"}")
     }
 
     fun stop() {

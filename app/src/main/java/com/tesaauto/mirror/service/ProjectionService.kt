@@ -139,7 +139,7 @@ class ProjectionService : Service() {
                 }
             }
 
-            val notification = createNotification("Servidor activo en http://$currentServerIp:8080")
+            val notification = createNotification("Activo en http://$currentServerIp:8080 y https://$currentServerIp:8443")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
             } else {
@@ -231,6 +231,9 @@ class ProjectionService : Service() {
                             put("shizukuAvailable", ShizukuManager.isServiceRunning())
                             put("isEncoding", videoEncoderPipeline?.isEncoding ?: false)
                             put("cachedSpsPps", videoEncoderPipeline?.cachedSpsPps != null)
+                            put("httpPort", embeddedServer?.port ?: 8080)
+                            put("httpsPort", embeddedServer?.sslPort ?: 8443)
+                            put("tlsActive", embeddedServer?.isTlsActive ?: false)
                         }
                     }
                 }
