@@ -6,15 +6,11 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.InputEvent
 import android.view.MotionEvent
-import com.tesaauto.mirror.display.ShizukuManager
 import com.tesaauto.mirror.display.VirtualDisplayManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.launch
 import java.lang.reflect.Method
 
 class TouchInputManager(
@@ -44,28 +40,7 @@ class TouchInputManager(
         null
     }
 
-    // Cola secuencial de comandos para evitar saturar el sistema con múltiples subprocesos sh/JVM simultáneos
-    private val commandChannel = Channel<String>(capacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     private val inputScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
-    init {
-        inputScope.launch {
-            var lastWakeTime = 0L
-            for (cmd in commandChannel) {
-                try {
-                    val now = SystemClock.uptimeMillis()
-                    // Si el dispositivo fue bloqueado o durmió, desbloquear ventana para que acepte toques
-                    if (now - lastWakeTime > 1500L) {
-                        lastWakeTime = now
-                        ShizukuManager.executeCommand("cmd window dismiss-keyguard")
-                    }
-                    ShizukuManager.executeCommand(cmd)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Error ejecutando comando de entrada: $cmd", e)
-                }
-            }
-        }
-    }
 
     private var downNormX: Double = 0.0
     private var downNormY: Double = 0.0
@@ -81,21 +56,10 @@ class TouchInputManager(
         val absX = (normX.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_WIDTH).toInt()
         val absY = (normY.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_HEIGHT).toInt()
 
-        Log.d(TAG, "Encolando Tap en ($absX, $absY) - displayId=$displayId")
-
-        if (ShizukuManager.hasPermission()) {
-            val cmd = if (displayId != android.view.Display.DEFAULT_DISPLAY) {
-                "input -d $displayId tap $absX $absY"
-            } else {
-                "input tap $absX $absY"
-            }
-            commandChannel.trySend(cmd)
-        } else {
-            val now = SystemClock.uptimeMillis()
-            lastDownTime = now
-            injectDirectMotionEvent(MotionEvent.ACTION_DOWN, absX.toFloat(), absY.toFloat(), now, displayId)
-            injectDirectMotionEvent(MotionEvent.ACTION_UP, absX.toFloat(), absY.toFloat(), now + 40, displayId)
-        }
+        val now = SystemClock.uptimeMillis()
+        lastDownTime = now
+        injectDirectMotionEvent(MotionEvent.ACTION_DOWN, absX.toFloat(), absY.toFloat(), now, displayId)
+        injectDirectMotionEvent(MotionEvent.ACTION_UP, absX.toFloat(), absY.toFloat(), now + 40, displayId)
     }
 
     /**
@@ -103,38 +67,24 @@ class TouchInputManager(
      */
     fun injectSwipe(normX1: Double, normY1: Double, normX2: Double, normY2: Double, durationMs: Int = 200) {
         val displayId = virtualDisplayManager.currentDisplayId
-        val x1 = (normX1.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_WIDTH).toInt()
-        val y1 = (normY1.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_HEIGHT).toInt()
-        val x2 = (normX2.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_WIDTH).toInt()
-        val y2 = (normY2.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_HEIGHT).toInt()
+        val x1 = (normX1.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_WIDTH).toFloat()
+        val y1 = (normY1.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_HEIGHT).toFloat()
+        val x2 = (normX2.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_WIDTH).toFloat()
+        val y2 = (normY2.coerceIn(0.0, 1.0) * VirtualDisplayManager.DEFAULT_HEIGHT).toFloat()
 
-        Log.d(TAG, "Encolando Swipe de ($x1, $y1) a ($x2, $y2) en ${durationMs}ms - displayId=$displayId")
-
-        if (ShizukuManager.hasPermission()) {
-            val cmd = if (displayId != android.view.Display.DEFAULT_DISPLAY) {
-                "input -d $displayId swipe $x1 $y1 $x2 $y2 $durationMs"
-            } else {
-                "input swipe $x1 $y1 $x2 $y2 $durationMs"
-            }
-            commandChannel.trySend(cmd)
-        }
+        val now = SystemClock.uptimeMillis()
+        lastDownTime = now
+        injectDirectMotionEvent(MotionEvent.ACTION_DOWN, x1, y1, now, displayId)
+        injectDirectMotionEvent(MotionEvent.ACTION_MOVE, x2, y2, now + durationMs, displayId)
+        injectDirectMotionEvent(MotionEvent.ACTION_UP, x2, y2, now + durationMs + 20, displayId)
     }
 
     /**
      * Inyecta un evento de tecla de sistema (ej. Back = 4, Home = 3).
      */
     fun injectKeyEvent(keyCode: Int) {
-        val displayId = virtualDisplayManager.currentDisplayId
-        Log.d(TAG, "Encolando KeyEvent keycode=$keyCode - displayId=$displayId")
-
-        if (ShizukuManager.hasPermission()) {
-            val cmd = if (displayId != android.view.Display.DEFAULT_DISPLAY) {
-                "input -d $displayId keyevent $keyCode"
-            } else {
-                "input keyevent $keyCode"
-            }
-            commandChannel.trySend(cmd)
-        }
+        // En Android Auto el control es directo por OAA
+        Log.d(TAG, "injectKeyEvent keycode=$keyCode")
     }
 
     /**

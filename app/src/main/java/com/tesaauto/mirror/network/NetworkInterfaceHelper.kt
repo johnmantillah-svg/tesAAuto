@@ -13,46 +13,96 @@ object NetworkInterfaceHelper {
     )
 
     /**
-     * Localiza la dirección IP de la interfaz wlan0 (punto de acceso/hotspot)
-     * o, en su defecto, la primera interfaz de red inalámbrica activa con dirección IPv4.
+     * Localiza la dirección IP de la interfaz de Hotspot (swlan0, ap0, wlan0) o Wi-Fi local.
+     * Excluye estrictamente interfaces celulares (rmnet, pdp) para evitar exponer la IP pública de datos móviles.
      */
     fun getHotspotOrWifiIpAddress(): InterfaceInfo? {
         try {
             val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
 
-            // 1. Prioridad: Interfaz wlan0 específica de hotspot / Wi-Fi local
-            val wlanInterface = interfaces.firstOrNull { 
-                it.isUp && !it.isLoopback && (it.name.equals("wlan0", ignoreCase = true) || it.name.startsWith("ap0"))
-            }
-
-            if (wlanInterface != null) {
-                val ip = getIpv4Address(wlanInterface)
-                if (ip != null) {
-                    return InterfaceInfo(
-                        name = wlanInterface.name,
-                        ipAddress = ip,
-                        isHotspotInterface = true
-                    )
+            // 1. Máxima Prioridad: Interfaces específicas de Zona Wi-Fi / Hotspot (swlan en Samsung, ap0, softap)
+            val hotspotPrefixes = listOf("swlan", "ap", "softap")
+            for (prefix in hotspotPrefixes) {
+                val candidate = interfaces.firstOrNull { 
+                    it.isUp && !it.isLoopback && it.name.startsWith(prefix, ignoreCase = true)
                 }
-            }
-
-            // 2. Fallback: cualquier interfaz no loopback activa con IPv4
-            for (iface in interfaces) {
-                if (iface.isUp && !iface.isLoopback) {
-                    val ip = getIpv4Address(iface)
-                    if (ip != null) {
+                if (candidate != null) {
+                    val ip = getIpv4Address(candidate)
+                    if (ip != null && isPrivateIp(ip)) {
                         return InterfaceInfo(
-                            name = iface.name,
+                            name = candidate.name,
                             ipAddress = ip,
-                            isHotspotInterface = iface.name.contains("wlan") || iface.name.contains("ap")
+                            isHotspotInterface = true
                         )
                     }
                 }
             }
+
+            // 2. Prioridad: Interfaz con rango clásico de Hotspot Android (192.168.43.x)
+            for (iface in interfaces) {
+                if (iface.isUp && !iface.isLoopback) {
+                    val ip = getIpv4Address(iface)
+                    if (ip != null && ip.startsWith("192.168.43.")) {
+                        return InterfaceInfo(
+                            name = iface.name,
+                            ipAddress = ip,
+                            isHotspotInterface = true
+                        )
+                    }
+                }
+            }
+
+            // 3. Prioridad: Interfaz cliente Wi-Fi (wlan0, wlan1)
+            val wlanCandidate = interfaces.firstOrNull { 
+                it.isUp && !it.isLoopback && it.name.startsWith("wlan", ignoreCase = true)
+            }
+            if (wlanCandidate != null) {
+                val ip = getIpv4Address(wlanCandidate)
+                if (ip != null && isPrivateIp(ip)) {
+                    return InterfaceInfo(
+                        name = wlanCandidate.name,
+                        ipAddress = ip,
+                        isHotspotInterface = false
+                    )
+                }
+            }
+
+            // 4. Fallback: Cualquier interfaz privada que NO sea celular ni loopback
+            for (iface in interfaces) {
+                if (iface.isUp && !iface.isLoopback && !isCellularOrVirtual(iface.name)) {
+                    val ip = getIpv4Address(iface)
+                    if (ip != null && isPrivateIp(ip)) {
+                        return InterfaceInfo(
+                            name = iface.name,
+                            ipAddress = ip,
+                            isHotspotInterface = false
+                        )
+                    }
+                }
+            }
+
+            // 5. Fallback final si no se detectó IP
+            return InterfaceInfo(
+                name = "hotspot_default",
+                ipAddress = "192.168.43.1",
+                isHotspotInterface = true
+            )
         } catch (e: Exception) {
             e.printStackTrace()
         }
-        return null
+        return InterfaceInfo(name = "fallback", ipAddress = "192.168.43.1", isHotspotInterface = true)
+    }
+
+    private fun isPrivateIp(ip: String): Boolean {
+        return ip.startsWith("192.168.") || ip.startsWith("10.") || ip.startsWith("172.")
+    }
+
+    private fun isCellularOrVirtual(name: String): Boolean {
+        val lower = name.lowercase()
+        return lower.startsWith("rmnet") || lower.startsWith("ccmni") || 
+               lower.startsWith("pdp") || lower.startsWith("dummy") || 
+               lower.startsWith("tun") || lower.startsWith("sit") || 
+               lower.startsWith("gre") || lower.startsWith("epdg")
     }
 
     private fun getIpv4Address(networkInterface: NetworkInterface): String? {

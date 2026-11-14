@@ -17,7 +17,7 @@ import android.os.PowerManager
 import android.net.wifi.WifiManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
-import com.tesaauto.mirror.display.ShizukuManager
+import com.tesaauto.mirror.aa.AndroidAutoHeadUnitClient
 import com.tesaauto.mirror.display.VirtualDisplayManager
 import com.tesaauto.mirror.input.TouchInputManager
 import com.tesaauto.mirror.network.NetworkInterfaceHelper
@@ -25,9 +25,6 @@ import com.tesaauto.mirror.server.TeslaEmbeddedServer
 import com.tesaauto.mirror.ui.MainActivity
 import com.tesaauto.mirror.video.ThermalAdaptationManager
 import com.tesaauto.mirror.video.VideoEncoderPipeline
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 
 class ProjectionService : Service() {
 
@@ -41,7 +38,10 @@ class ProjectionService : Service() {
     }
 
     private val binder = LocalBinder()
-    private var embeddedServer: TeslaEmbeddedServer? = null
+    var embeddedServer: TeslaEmbeddedServer? = null
+        private set
+    var aaClient: AndroidAutoHeadUnitClient? = null
+        private set
     var virtualDisplayManager: VirtualDisplayManager? = null
         private set
     var videoEncoderPipeline: VideoEncoderPipeline? = null
@@ -55,12 +55,7 @@ class ProjectionService : Service() {
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == Intent.ACTION_SCREEN_OFF) {
-                Log.i(TAG, "Pantalla física apagada detectada. Manteniendo VirtualDisplay despierto...")
-                if (ShizukuManager.hasPermission()) {
-                    CoroutineScope(Dispatchers.IO).launch {
-                        ShizukuManager.executeCommand("cmd window dismiss-keyguard")
-                    }
-                }
+                Log.i(TAG, "Pantalla física apagada detectada. Manteniendo proyección activa...")
             }
         }
     }
@@ -77,15 +72,16 @@ class ProjectionService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        val initialNotification = createNotification("Iniciando servicio de proyección vehicular...")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, initialNotification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            startForeground(NOTIFICATION_ID, initialNotification)
+        }
         virtualDisplayManager = VirtualDisplayManager(
             context = this,
             onDisplayCreated = { displayId ->
                 Log.i(TAG, "VirtualDisplay asignado en servicio con ID=$displayId")
-                if (ShizukuManager.hasPermission()) {
-                    CoroutineScope(Dispatchers.IO).launch {
-                        ShizukuManager.executeCommand("cmd window dismiss-keyguard")
-                    }
-                }
             },
             onDisplayReleased = {
                 Log.i(TAG, "VirtualDisplay liberado en servicio")
@@ -103,13 +99,20 @@ class ProjectionService : Service() {
     }
 
     private fun startProjectionServer() {
+        if (embeddedServer?.isRunning == true && aaClient != null) {
+            Log.i(TAG, "startProjectionServer: El servidor ya está en ejecución activa")
+            return
+        }
+
         try {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TesAAuto:ProjectionWakeLock").apply {
-                setReferenceCounted(false)
-                acquire()
+            if (wakeLock?.isHeld != true) {
+                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TesAAuto:ProjectionWakeLock").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+                Log.i(TAG, "WakeLock adquirido para mantener proyección con pantalla apagada")
             }
-            Log.i(TAG, "WakeLock adquirido para mantener proyección con pantalla apagada")
 
             try {
                 val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -139,108 +142,114 @@ class ProjectionService : Service() {
                 }
             }
 
-            val notification = createNotification("Servidor activo en http://$currentServerIp:8080")
+            val notification = createNotification("Servidor vehicular activo en http://$currentServerIp:8080")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
 
-            // 1. Configurar optimizaciones globales multi-display vía Shizuku si está disponible
-            if (ShizukuManager.hasPermission()) {
-                CoroutineScope(Dispatchers.IO).launch {
-                    try {
-                        ShizukuManager.configureMultiDisplaySupport()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error configurando multi-display Shizuku", e)
-                    }
-                }
-            }
-
-            // 2. Inicializar el pipeline de codificación por hardware MediaCodec
-            try {
-                videoEncoderPipeline = VideoEncoderPipeline(
-                    onFrameEncoded = { frameData, _ ->
-                        embeddedServer?.broadcastVideoFrame(frameData)
-                    }
-                )
-                val encoderInputSurface = videoEncoderPipeline!!.start()
-
-                // 3. Vincular el VirtualDisplay secundario a la superficie de MediaCodec
-                virtualDisplayManager?.createVirtualDisplay(surface = encoderInputSurface)
-
-                // 4. Iniciar el gestor térmico adaptativo
-                thermalManager = ThermalAdaptationManager(this) { profile ->
-                    videoEncoderPipeline?.updateBitrate(profile.targetBitrate)
-                }.apply {
-                    register()
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error iniciando pipeline multimedia por hardware", e)
-            }
-
-            // 5. Iniciar servidor embebido Ktor CIO con enrutamiento de eventos táctiles
-            try {
-                embeddedServer = TeslaEmbeddedServer(
-                    context = applicationContext,
-                    host = "0.0.0.0",
-                    port = 8080,
-                    onClientConnected = {
-                        // Enviar IDR frame de sincronización inmediata al cliente recién conectado
-                        videoEncoderPipeline?.requestSyncFrame()
-                        if (ShizukuManager.hasPermission()) {
-                            CoroutineScope(Dispatchers.IO).launch {
-                                ShizukuManager.executeCommand("wm dismiss-keyguard")
-                                virtualDisplayManager?.currentDisplayId?.let { id ->
-                                    if (id != android.view.Display.DEFAULT_DISPLAY) {
-                                        ShizukuManager.executeCommand("cmd activity focus-display $id")
-                                    }
-                                }
+            // 1. Iniciar servidor embebido Ktor CIO con enrutamiento de eventos táctiles si no está corriendo
+            if (embeddedServer == null || embeddedServer?.isRunning == false) {
+                try {
+                    embeddedServer = TeslaEmbeddedServer(
+                        context = applicationContext,
+                        host = "0.0.0.0",
+                        port = 8080,
+                        onClientConnected = {
+                            Log.i(TAG, "Tesla browser conectado vía WebSocket. Asertando VideoFocus a Android Auto...")
+                            aaClient?.requestVideoFocus(projected = true, force = true)
+                        },
+                        onTouchEventReceived = { type, x, y, ts ->
+                            if (aaClient?.isConnected == true) {
+                                aaClient?.sendTouchEvent(type, x, y)
+                            } else {
+                                touchInputManager?.processTouchEvent(type, x, y, ts)
                             }
                         }
-                    },
-                    onTouchEventReceived = { type, x, y, ts ->
-                        touchInputManager?.processTouchEvent(type, x, y, ts)
-                    }
-                ).apply {
-                    getInitialConfigFrame = {
-                        videoEncoderPipeline?.cachedSpsPps
-                    }
-                    onHomeRequest = {
-                        virtualDisplayManager?.showPresentation()
-                        touchInputManager?.injectKeyEvent(3)
-                    }
-                    onLaunchAppRequest = { pkg ->
-                        virtualDisplayManager?.launchApplicationOnDisplay(pkg) ?: false
-                    }
-                    onTapRequest = { x, y ->
-                        touchInputManager?.injectTap(x, y)
-                    }
-                    onSwipeRequest = { x1, y1, x2, y2, dur ->
-                        touchInputManager?.injectSwipe(x1, y1, x2, y2, dur)
-                    }
-                    onKeyRequest = { code ->
-                        touchInputManager?.injectKeyEvent(code)
-                    }
-                    onGetStatusRequest = {
-                        org.json.JSONObject().apply {
-                            put("serverRunning", isRunning)
-                            put("displayId", virtualDisplayManager?.currentDisplayId ?: -1)
-                            put("displayActive", virtualDisplayManager?.isDisplayActive ?: false)
-                            put("shizukuPermission", ShizukuManager.hasPermission())
-                            put("shizukuAvailable", ShizukuManager.isServiceRunning())
-                            put("isEncoding", videoEncoderPipeline?.isEncoding ?: false)
-                            put("cachedSpsPps", videoEncoderPipeline?.cachedSpsPps != null)
-                            put("httpPort", embeddedServer?.port ?: 8080)
-                            put("httpsPort", embeddedServer?.sslPort ?: 8443)
-                            put("tlsActive", embeddedServer?.isTlsActive ?: false)
+                    ).apply {
+                        getInitialConfigFrame = {
+                            aaClient?.cachedSpsPps ?: videoEncoderPipeline?.cachedSpsPps
+                        }
+                        onHomeRequest = {
+                            if (aaClient?.isConnected != true) {
+                                virtualDisplayManager?.showPresentation()
+                                touchInputManager?.injectKeyEvent(3)
+                            }
+                        }
+                        onLaunchAppRequest = { pkg ->
+                            if (aaClient?.isConnected == true) {
+                                Log.i(TAG, "Lanzamiento vehicular solicitado para $pkg bajo Android Auto")
+                                true
+                            } else {
+                                virtualDisplayManager?.launchApplicationOnDisplay(pkg) ?: false
+                            }
+                        }
+                        onTapRequest = { x, y ->
+                            if (aaClient?.isConnected == true) {
+                                aaClient?.sendTouchEvent("down", x, y)
+                                aaClient?.sendTouchEvent("up", x, y)
+                            } else {
+                                touchInputManager?.injectTap(x, y)
+                            }
+                        }
+                        onSwipeRequest = { x1, y1, x2, y2, dur ->
+                            if (aaClient?.isConnected == true) {
+                                aaClient?.sendTouchEvent("down", x1, y1)
+                                aaClient?.sendTouchEvent("move", x2, y2)
+                                aaClient?.sendTouchEvent("up", x2, y2)
+                            } else {
+                                touchInputManager?.injectSwipe(x1, y1, x2, y2, dur)
+                            }
+                        }
+                        onKeyRequest = { code ->
+                            touchInputManager?.injectKeyEvent(code)
+                        }
+                        onGetStatusRequest = {
+                            org.json.JSONObject().apply {
+                                put("serverRunning", isRunning)
+                                put("aaConnected", aaClient?.isConnected ?: false)
+                                put("aaVideoActive", aaClient?.isVideoActive ?: false)
+                                put("displayId", virtualDisplayManager?.currentDisplayId ?: -1)
+                                put("displayActive", virtualDisplayManager?.isDisplayActive ?: false)
+                                put("isEncoding", videoEncoderPipeline?.isEncoding ?: false)
+                                put("cachedSpsPps", (aaClient?.cachedSpsPps != null || videoEncoderPipeline?.cachedSpsPps != null))
+                                put("httpPort", embeddedServer?.port ?: 8080)
+                                put("httpsPort", embeddedServer?.sslPort ?: 8443)
+                                put("tlsActive", embeddedServer?.isTlsActive ?: false)
+                                put("ip", currentServerIp)
+                            }
                         }
                     }
+                    embeddedServer?.start()
+                    Log.i(TAG, "TeslaEmbeddedServer iniciado con éxito en http://$currentServerIp:8080")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error iniciando TeslaEmbeddedServer", e)
                 }
-                embeddedServer?.start()
-                Log.i(TAG, "TeslaEmbeddedServer iniciado con éxito en http://$currentServerIp:8080")
-            } catch (e: Exception) {
-                Log.e(TAG, "Error iniciando TeslaEmbeddedServer", e)
+            }
+
+            // 2. Iniciar cliente receptor de Android Auto Head Unit (puerto 5277 local)
+            if (aaClient == null) {
+                try {
+                    aaClient = AndroidAutoHeadUnitClient(
+                        context = applicationContext,
+                        host = "127.0.0.1",
+                        port = 5277,
+                        onVideoFrame = { nalBytes ->
+                            embeddedServer?.broadcastVideoFrame(nalBytes)
+                        },
+                        onConnected = {
+                            Log.i(TAG, "Android Auto Head Unit conectado y listo para streaming")
+                        },
+                        onDisconnected = { reason ->
+                            Log.i(TAG, "Android Auto desconectado: $reason")
+                        }
+                    ).apply {
+                        start()
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error iniciando AndroidAutoHeadUnitClient", e)
+                }
             }
         } catch (t: Throwable) {
             Log.e(TAG, "Fallo crítico en startProjectionServer", t)
@@ -284,6 +293,9 @@ class ProjectionService : Service() {
             embeddedServer?.stop()
             embeddedServer = null
 
+            aaClient?.stop()
+            aaClient = null
+
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         } catch (e: Exception) {
@@ -303,7 +315,7 @@ class ProjectionService : Service() {
                 "TesAAuto Projection Service",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Mantiene activo el servidor de streaming para Tesla"
+                description = "Mantiene activo el servidor de streaming vehicular para Tesla"
             }
             val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
@@ -318,7 +330,7 @@ class ProjectionService : Service() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("TesAAuto Mirror Activo")
+            .setContentTitle("TesAAuto Mirror (Vehicular)")
             .setContentText(contentText)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentIntent(pendingIntent)
