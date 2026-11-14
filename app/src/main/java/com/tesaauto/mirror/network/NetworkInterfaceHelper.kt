@@ -20,25 +20,7 @@ object NetworkInterfaceHelper {
         try {
             val interfaces = Collections.list(NetworkInterface.getNetworkInterfaces())
 
-            // 1. Máxima Prioridad: Interfaces específicas de Zona Wi-Fi / Hotspot (swlan en Samsung, ap0, softap)
-            val hotspotPrefixes = listOf("swlan", "ap", "softap")
-            for (prefix in hotspotPrefixes) {
-                val candidate = interfaces.firstOrNull { 
-                    it.isUp && !it.isLoopback && it.name.startsWith(prefix, ignoreCase = true)
-                }
-                if (candidate != null) {
-                    val ip = getIpv4Address(candidate)
-                    if (ip != null && isPrivateIp(ip)) {
-                        return InterfaceInfo(
-                            name = candidate.name,
-                            ipAddress = ip,
-                            isHotspotInterface = true
-                        )
-                    }
-                }
-            }
-
-            // 2. Prioridad: Interfaz con rango clásico de Hotspot Android (192.168.43.x)
+            // 1. Máxima Prioridad: Interfaz con rango clásico de Hotspot Android (192.168.43.x) o ap/softap
             for (iface in interfaces) {
                 if (iface.isUp && !iface.isLoopback) {
                     val ip = getIpv4Address(iface)
@@ -52,7 +34,22 @@ object NetworkInterfaceHelper {
                 }
             }
 
-            // 3. Prioridad: Interfaz cliente Wi-Fi (wlan0, wlan1)
+            // 2. Prioridad: Interfaces específicas de punto de acceso (ap0, softap)
+            val dedicatedAp = interfaces.firstOrNull { 
+                it.isUp && !it.isLoopback && (it.name.startsWith("ap", ignoreCase = true) || it.name.startsWith("softap", ignoreCase = true))
+            }
+            if (dedicatedAp != null) {
+                val ip = getIpv4Address(dedicatedAp)
+                if (ip != null && isPrivateIp(ip)) {
+                    return InterfaceInfo(
+                        name = dedicatedAp.name,
+                        ipAddress = ip,
+                        isHotspotInterface = true
+                    )
+                }
+            }
+
+            // 3. Prioridad: Interfaz cliente Wi-Fi estándar (wlan0, wlan1) para pruebas locales en red doméstica
             val wlanCandidate = interfaces.firstOrNull { 
                 it.isUp && !it.isLoopback && it.name.startsWith("wlan", ignoreCase = true)
             }
@@ -63,6 +60,24 @@ object NetworkInterfaceHelper {
                         name = wlanCandidate.name,
                         ipAddress = ip,
                         isHotspotInterface = false
+                    )
+                }
+            }
+
+            // 4. Prioridad: Otras interfaces Wi-Fi P2P / Hotspot Samsung (swlan)
+            val swlanCandidate = interfaces.firstOrNull {
+                it.isUp && !it.isLoopback && it.name.startsWith("swlan", ignoreCase = true)
+            }
+            if (swlanCandidate != null) {
+                val ip = getIpv4Address(swlanCandidate)
+                if (ip != null && isPrivateIp(ip)) {
+                    return InterfaceInfo(
+                        name = swlanCandidate.name,
+                        ipAddress = ip,
+                        isHotspotInterface = true
+                    )
+                }
+            }
                     )
                 }
             }

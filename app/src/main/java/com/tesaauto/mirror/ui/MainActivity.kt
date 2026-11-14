@@ -240,11 +240,10 @@ class MainActivity : AppCompatActivity() {
                 PASOS PARA NAVEGAR EN TU TESLA:
                 1. Enciende la Zona Wi-Fi (Hotspot 5 GHz) de tu teléfono.
                 2. En Ajustes de Android Auto, pulsa ⋮ y elige 'Iniciar servidor de unidad princ.'.
-                3. Toca 'INICIAR PROYECCIÓN VEHICULAR' arriba (acepta el permiso de enlace).
+                3. Toca 'INICIAR PROYECCIÓN VEHICULAR' arriba.
                 4. En tu Tesla, conéctate a tu Zona Wi-Fi (marca 'Permanecer conectado en marcha').
-                5. Abre el navegador del Tesla e ingresa:
-                   http://100.99.9.9:8080
-                   (o http://teslamirror.net:8080)
+                5. Abre el navegador del Tesla e ingresa tu portal oficial:
+                   https://johnmantillah-svg.github.io/tesAAuto/
             """.trimIndent()
             textSize = 13f
             setTextColor(Color.parseColor("#7F8C8D"))
@@ -451,23 +450,27 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshNetworkInfo() {
         val iface = NetworkInterfaceHelper.getHotspotOrWifiIpAddress()
-        val detectedIp = iface?.ipAddress ?: "0.0.0.0"
+        val detectedIp = iface?.ipAddress ?: "192.168.43.1"
+        val sslipHost = detectedIp.replace(".", "-") + ".sslip.io"
 
         val sb = StringBuilder()
         sb.append("🚗 EN EL NAVEGADOR DEL TESLA:\n")
-        sb.append("http://${TeslaVpnService.VPN_IP}:8080\n")
-        sb.append("(o http://teslamirror.net:8080)\n")
-        sb.append("https://${TeslaVpnService.VPN_IP}:8443\n")
+        sb.append("http://$sslipHost:8080\n")
+        sb.append("\n🌐 O alternativo GitHub Pages:\n")
+        sb.append("https://johnmantillah-svg.github.io/tesAAuto/\n")
 
-        if (detectedIp != "0.0.0.0" && detectedIp != TeslaVpnService.VPN_IP) {
-            sb.append("\n📱 IP Local Hotspot Móvil: $detectedIp")
+        if (detectedIp != "0.0.0.0") {
+            sb.append("\n📱 IP Local Móvil: $detectedIp")
         }
 
         urlText.text = sb.toString().trim()
     }
 
     private fun copyUrlToClipboard() {
-        val url = "http://${TeslaVpnService.VPN_IP}:8080"
+        val iface = NetworkInterfaceHelper.getHotspotOrWifiIpAddress()
+        val detectedIp = iface?.ipAddress ?: "192.168.43.1"
+        val sslipHost = detectedIp.replace(".", "-") + ".sslip.io"
+        val url = "http://$sslipHost:8080"
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboard.setPrimaryClip(ClipData.newPlainText("TesAAuto URL", url))
         Toast.makeText(this, "Dirección copiada: $url", Toast.LENGTH_SHORT).show()

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>TesAAuto Mirror - Tesla Client</title>
-  <script src="/jmuxer.min.js"></script>
+  <script src="jmuxer.min.js"></script>
   <style>
     * {
       box-sizing: border-box;
@@ -193,6 +193,11 @@
 <body>
   <div id="toast"></div>
 
+  <div id="github-pages-banner" style="display:none; background:#16a085; color:#fff; padding:8px 16px; font-size:13px; text-align:center; font-weight:600; border-bottom:1px solid #1abc9c;">
+    🚗 Conexión recomendada para Tesla (Sin certificados ni alertas): 
+    <a id="direct-tesla-btn" href="#" style="background:#fff; color:#16a085; padding:4px 12px; border-radius:6px; margin-left:10px; text-decoration:none; font-weight:bold; display:inline-block;">Abrir TesAAuto Directo</a>
+  </div>
+
   <div id="https-banner" style="display:none; background:#d35400; color:#fff; padding:8px 16px; font-size:13px; text-align:center; font-weight:600; z-index:100; border-bottom:1px solid #e67e22;">
     ⚠️ Conexión HTTP detectada. Tesla pausa el video en marcha con HTTP. 
     <a id="https-btn" href="#" style="background:#fff; color:#d35400; padding:4px 12px; border-radius:6px; margin-left:10px; text-decoration:none; font-weight:bold; display:inline-block;">Cambiar a HTTPS (Puerto 8443)</a>
@@ -203,6 +208,8 @@
     <div id="stats">
       <span>FPS: <strong id="fps-val">0</strong></span>
       <span>RTT: <strong id="rtt-val">--</strong> ms</span>
+      <span>Host: <input id="phone-host-input" type="text" style="background:#1b2230; color:#fff; border:1px solid #34495e; border-radius:4px; padding:2px 6px; width:120px; font-size:12px;" placeholder="IP Celular" /></span>
+      <button id="reconnect-btn" style="background:#2980b9; color:#fff; border:none; border-radius:4px; padding:2px 8px; font-size:12px; cursor:pointer;" onclick="manualReconnect()">Conectar</button>
       <span>Decoder: <strong id="dec-mode">Detectando...</strong></span>
     </div>
     <div id="status-badge" class="badge disconnected">
@@ -489,12 +496,49 @@
     }
     drawIdleScreen();
 
-    function connect() {
-      const loc = window.location;
-      const wsProto = (loc.protocol === 'https:') ? 'wss:' : 'ws:';
-      const wsUrl = `${wsProto}//${loc.host}/ws`;
+    function getTargetHost() {
+      const urlParams = new URLSearchParams(window.location.search);
+      const queryHost = urlParams.get('host') || urlParams.get('ip');
+      if (queryHost) return queryHost;
 
-      statusText.textContent = 'Conectando...';
+      const savedHost = localStorage.getItem('tesaauto_phone_host');
+      if (savedHost) return savedHost;
+
+      // Si la página se sirve desde el mismo teléfono (ej. http://192.168...:8080)
+      if (window.location.hostname !== 'johnmantillah-svg.github.io' && window.location.hostname !== 'localhost') {
+        return window.location.hostname;
+      }
+
+      // Por defecto en Hotspot Android Samsung es 192.168.43.1
+      return '192.168.43.1';
+    }
+
+    function manualReconnect() {
+      const input = document.getElementById('phone-host-input');
+      if (input && input.value.trim()) {
+        localStorage.setItem('tesaauto_phone_host', input.value.trim());
+      }
+      if (ws) {
+        try { ws.close(); } catch(e) {}
+      }
+      connect();
+    }
+
+    function connect() {
+      const targetHost = getTargetHost();
+      const hostInput = document.getElementById('phone-host-input');
+      if (hostInput && !hostInput.value) {
+        hostInput.value = targetHost;
+      }
+
+      // Determinar puerto y protocolo: si estamos en HTTPS usamos wss://host:8443, si HTTP ws://host:8080
+      const isHttps = (window.location.protocol === 'https:');
+      const wsPort = isHttps ? 8443 : 8080;
+      const wsProto = isHttps ? 'wss:' : 'ws:';
+      const wsUrl = `${wsProto}//${targetHost}:${wsPort}/ws`;
+
+      console.log('[TesAAuto] Intentando conectar a:', wsUrl);
+      statusText.textContent = `Conectando (${targetHost})...`;
       statusBadge.className = 'badge disconnected';
 
       try {
@@ -504,8 +548,21 @@
         ws.onopen = () => {
           statusText.textContent = 'En Vivo';
           statusBadge.className = 'badge connected';
-          console.log('[TesAAuto] WebSocket conectado');
+          console.log('[TesAAuto] WebSocket conectado con éxito a', wsUrl);
+          showToast(`Conectado al celular (${targetHost})`);
           startPingLoop();
+        };
+
+        ws.onerror = (e) => {
+          console.warn('[TesAAuto] Error en WebSocket:', e);
+          statusText.textContent = 'Error Conexión';
+        };
+
+        ws.onclose = () => {
+          console.log('[TesAAuto] WebSocket desconectado. Reintentando en 3s...');
+          statusText.textContent = 'Reintentando...';
+          statusBadge.className = 'badge disconnected';
+          setTimeout(connect, 3000);
         };
 
         ws.onmessage = (event) => {
@@ -756,7 +813,17 @@
     });
 
     window.addEventListener('DOMContentLoaded', () => {
-      if (window.location.protocol === 'http:') {
+      if (window.location.hostname === 'johnmantillah-svg.github.io') {
+        const targetHost = getTargetHost();
+        const sslipHost = targetHost.replace(/\./g, '-') + '.sslip.io';
+        const directBtn = document.getElementById('direct-tesla-btn');
+        const directBanner = document.getElementById('github-pages-banner');
+        if (directBtn && directBanner) {
+          directBtn.href = `http://${sslipHost}:8080/`;
+          directBtn.textContent = `Abrir TesAAuto Directo (http://${sslipHost}:8080)`;
+          directBanner.style.display = 'block';
+        }
+      } else if (window.location.protocol === 'http:') {
         const banner = document.getElementById('https-banner');
         const btn = document.getElementById('https-btn');
         if (banner && btn) {
