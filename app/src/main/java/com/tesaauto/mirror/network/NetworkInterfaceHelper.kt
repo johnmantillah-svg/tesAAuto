@@ -78,9 +78,6 @@ object NetworkInterfaceHelper {
                     )
                 }
             }
-                    )
-                }
-            }
 
             // 4. Fallback: Cualquier interfaz privada que NO sea celular ni loopback
             for (iface in interfaces) {
