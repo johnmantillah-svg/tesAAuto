@@ -210,6 +210,7 @@
       <span>RTT: <strong id="rtt-val">--</strong> ms</span>
       <span>Host: <input id="phone-host-input" type="text" style="background:#1b2230; color:#fff; border:1px solid #34495e; border-radius:4px; padding:2px 6px; width:120px; font-size:12px;" placeholder="IP Celular" /></span>
       <button id="reconnect-btn" style="background:#2980b9; color:#fff; border:none; border-radius:4px; padding:2px 8px; font-size:12px; cursor:pointer;" onclick="manualReconnect()">Conectar</button>
+      <button id="diag-btn" style="background:#2c3e50; color:#fff; border:1px solid #4a627a; border-radius:4px; padding:2px 8px; font-size:12px; cursor:pointer;" onclick="checkDiag()" title="Ver diagnóstico">⚙️ Diag</button>
       <span>Decoder: <strong id="dec-mode">Detectando...</strong></span>
     </div>
     <div id="status-badge" class="badge disconnected">
@@ -221,47 +222,10 @@
   <div id="viewport-container">
     <canvas id="video-canvas" width="1280" height="720"></canvas>
     <video id="video-player" width="1280" height="720" autoplay muted playsinline></video>
-    <div id="overlay-message">
-      <h2 id="overlay-title">Conectado con Éxito</h2>
-      <p id="overlay-subtitle">Pulsa una aplicación en la barra inferior para iniciar la proyección en la pantalla de Tesla.</p>
-      <div style="display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
-        <button class="dock-btn" style="background:#00B0FF;" onclick="launchApp('com.waze', 'Waze')">🚗 Waze</button>
-        <button class="dock-btn" style="background:#1E88E5;" onclick="launchApp('com.google.android.apps.maps', 'Google Maps')">🗺️ Google Maps</button>
-        <button class="dock-btn" style="background:#FB542B;" onclick="launchApp('com.brave.browser', 'Brave')">🦁 Brave</button>
-        <button class="dock-btn" style="background:#1DB954;" onclick="launchApp('com.spotify.music', 'Spotify')">🎵 Spotify</button>
-      </div>
+    <div id="overlay-message" style="display:none;">
+      <h2 id="overlay-title">Reconectando...</h2>
+      <p id="overlay-subtitle">Restableciendo enlace vehicular con Android Auto...</p>
     </div>
-  </div>
-
-  <div id="dock-bar">
-    <button class="dock-btn nav-action" onclick="sendKey(4)" title="Botón Atrás de Android">
-      <span class="dock-icon">🔙</span>
-      <span>Atrás</span>
-    </button>
-    <button class="dock-btn nav-action" onclick="goHome()" title="Botón Inicio / Dashboard de Tesla">
-      <span class="dock-icon">🏠</span>
-      <span>Inicio</span>
-    </button>
-    <button class="dock-btn" onclick="launchApp('com.waze', 'Waze')">
-      <span class="dock-icon">🚗</span>
-      <span>Waze</span>
-    </button>
-    <button class="dock-btn" onclick="launchApp('com.google.android.apps.maps', 'Google Maps')">
-      <span class="dock-icon">🗺️</span>
-      <span>Google Maps</span>
-    </button>
-    <button class="dock-btn" onclick="launchApp('com.brave.browser', 'Brave')">
-      <span class="dock-icon">🦁</span>
-      <span>Brave</span>
-    </button>
-    <button class="dock-btn" onclick="launchApp('com.spotify.music', 'Spotify')">
-      <span class="dock-icon">🎵</span>
-      <span>Spotify</span>
-    </button>
-    <button class="dock-btn" onclick="checkDiag()">
-      <span class="dock-icon">⚙️</span>
-      <span>Diagnóstico</span>
-    </button>
   </div>
 
   <script>
@@ -301,7 +265,11 @@
     }
 
     async function launchApp(pkg, name) {
-      showToast(`Iniciando ${name} en pantalla...`);
+      if (firstFrameReceived) {
+        showToast(`Toca el icono de ${name} en la barra vehicular de la pantalla`, 3000);
+        return;
+      }
+      showToast(`Conectando con Android Auto...`);
       try {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ action: 'launch', package: pkg }));
@@ -310,7 +278,6 @@
           const data = await resp.json();
           console.log('[TesAAuto] Resultado de lanzamiento:', data);
         }
-        showToast(`Lanzando ${name}...`);
       } catch (e) {
         console.error('[TesAAuto] Error en launchApp:', e);
       }
@@ -464,10 +431,11 @@
     }
 
     function onFrameRendered() {
-      if (!firstFrameReceived) {
-        firstFrameReceived = true;
+      firstFrameReceived = true;
+      if (overlay && (overlay.style.display !== 'none' || overlay.style.opacity !== '0')) {
         overlay.style.opacity = '0';
         overlay.style.pointerEvents = 'none';
+        overlay.style.display = 'none';
       }
       trackFps();
     }
@@ -504,13 +472,13 @@
       const savedHost = localStorage.getItem('tesaauto_phone_host');
       if (savedHost) return savedHost;
 
-      // Si la página se sirve desde el mismo teléfono (ej. http://192.168...:8080)
-      if (window.location.hostname !== 'johnmantillah-svg.github.io' && window.location.hostname !== 'localhost') {
+      // Si la página se sirve desde el mismo teléfono o proxy local (ej. 192.168.x.x, 127.0.0.1, localhost)
+      if (window.location.hostname !== 'johnmantillah-svg.github.io') {
         return window.location.hostname;
       }
 
-      // Por defecto en Hotspot Android Samsung es 192.168.43.1
-      return '192.168.43.1';
+      // Por defecto dominio seguro con certificado Let's Encrypt
+      return 'taada.top';
     }
 
     function manualReconnect() {
@@ -531,9 +499,9 @@
         hostInput.value = targetHost;
       }
 
-      // Determinar puerto y protocolo: si estamos en HTTPS usamos wss://host:8443, si HTTP ws://host:8080
+      // Determinar puerto y protocolo: si estamos en HTTPS usamos wss, si HTTP ws
       const isHttps = (window.location.protocol === 'https:');
-      const wsPort = isHttps ? 8443 : 8080;
+      const wsPort = window.location.port ? window.location.port : (isHttps ? 8443 : 8080);
       const wsProto = isHttps ? 'wss:' : 'ws:';
       const wsUrl = `${wsProto}//${targetHost}:${wsPort}/ws`;
 
@@ -551,18 +519,6 @@
           console.log('[TesAAuto] WebSocket conectado con éxito a', wsUrl);
           showToast(`Conectado al celular (${targetHost})`);
           startPingLoop();
-        };
-
-        ws.onerror = (e) => {
-          console.warn('[TesAAuto] Error en WebSocket:', e);
-          statusText.textContent = 'Error Conexión';
-        };
-
-        ws.onclose = () => {
-          console.log('[TesAAuto] WebSocket desconectado. Reintentando en 3s...');
-          statusText.textContent = 'Reintentando...';
-          statusBadge.className = 'badge disconnected';
-          setTimeout(connect, 3000);
         };
 
         ws.onmessage = (event) => {
@@ -618,6 +574,9 @@
                 jmuxer.feed({
                   video: u8
                 });
+                if (videoElem.paused) {
+                  videoElem.play().catch(() => {});
+                }
                 onFrameRendered();
               } catch (jmErr) {
                 console.error('[TesAAuto] Error en JMuxer feed:', jmErr);
@@ -631,10 +590,15 @@
         ws.onclose = () => {
           statusText.textContent = 'Desconectado';
           statusBadge.className = 'badge disconnected';
-          overlay.style.opacity = '1';
-          overlay.style.pointerEvents = 'auto';
-          document.getElementById('overlay-title').textContent = 'Conexión interrumpida';
-          document.getElementById('overlay-subtitle').textContent = 'Reintentando conexión automática en 2 segundos...';
+          if (!firstFrameReceived && overlay) {
+            overlay.style.display = 'block';
+            overlay.style.opacity = '1';
+            overlay.style.pointerEvents = 'auto';
+            document.getElementById('overlay-title').textContent = 'Reconectando...';
+            document.getElementById('overlay-subtitle').textContent = 'Restableciendo enlace vehicular con Android Auto...';
+          } else {
+            showToast('⚠️ Reconexión vehicular en curso...', 1800);
+          }
           scheduleReconnect();
         };
 
