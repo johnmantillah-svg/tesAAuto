@@ -24,15 +24,20 @@ import io.ktor.server.websocket.timeout
 import io.ktor.server.websocket.webSocket
 import io.ktor.websocket.Frame
 import io.ktor.websocket.WebSocketSession
+import io.ktor.websocket.readBytes
 import io.ktor.websocket.readText
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.security.KeyStore
 import java.time.Duration
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArraySet
 
 class TeslaEmbeddedServer(
     private val context: Context,
@@ -55,7 +60,20 @@ class TeslaEmbeddedServer(
     var getInitialConfigFrame: (() -> ByteArray?)? = null
 
     private var serverEngine: ApplicationEngine? = null
-    private val activeSessions = ConcurrentHashMap.newKeySet<WebSocketSession>()
+
+    private class ConnectedClient(
+        val session: WebSocketSession,
+        val frameChannel: Channel<ByteArray> = Channel(capacity = 2, onBufferOverflow = BufferOverflow.DROP_OLDEST),
+        val sendMutex: Mutex = Mutex()
+    ) {
+        suspend fun sendFrame(frame: Frame) {
+            sendMutex.withLock {
+                session.send(frame)
+            }
+        }
+    }
+
+    private val activeClients = CopyOnWriteArraySet<ConnectedClient>()
     private val serverScope = CoroutineScope(Dispatchers.IO)
     private var lastLaunchTime = 0L
     private var lastLaunchPkg = ""
@@ -78,16 +96,31 @@ class TeslaEmbeddedServer(
     var isTlsActive: Boolean = false
         private set
 
-    private fun loadKeyStore(): KeyStore? {
+    private fun loadKeyStore(): Pair<KeyStore, String>? {
+        // 1. Prioridad: Certificado oficial Let's Encrypt (CN=taada.top)
+        try {
+            val ks = KeyStore.getInstance("PKCS12")
+            context.assets.open("keystore/server_pbe.p12").use { input ->
+                ks.load(input, "aa".toCharArray())
+            }
+            if (ks.containsAlias("tesla")) {
+                Log.i(TAG, "✅ Keystore TLS oficial Let's Encrypt cargado (alias: tesla, CN=taada.top)")
+                return Pair(ks, "tesla")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "No se pudo cargar server_pbe.p12: ${e.message}")
+        }
+
+        // 2. Fallback
         return try {
             val ks = KeyStore.getInstance("PKCS12")
             context.assets.open("keystore/tesaauto.p12").use { input ->
                 ks.load(input, "tesaautopassword".toCharArray())
             }
-            Log.i(TAG, "Keystore TLS PKCS12 cargado con éxito para HTTPS")
-            ks
+            Log.i(TAG, "Keystore TLS fallback cargado (alias: tesaauto)")
+            Pair(ks, "tesaauto")
         } catch (e: Exception) {
-            Log.w(TAG, "No se pudo cargar keystore TLS: ${e.message}. El servidor solo operará en HTTP.")
+            Log.w(TAG, "No se pudo cargar keystore fallback: ${e.message}. El servidor solo operará en HTTP.")
             null
         }
     }
@@ -95,7 +128,7 @@ class TeslaEmbeddedServer(
     fun start() {
         if (isRunning) return
 
-        val keyStore = loadKeyStore()
+        val keyStorePair = loadKeyStore()
 
         val environment = applicationEngineEnvironment {
             connector {
@@ -103,19 +136,35 @@ class TeslaEmbeddedServer(
                 this.host = this@TeslaEmbeddedServer.host
             }
 
-            if (keyStore != null) {
+            if (keyStorePair != null) {
+                val (keyStore, keyAlias) = keyStorePair
+                val pwd = if (keyAlias == "tesla") "aa".toCharArray() else "tesaautopassword".toCharArray()
                 try {
                     sslConnector(
                         keyStore = keyStore,
-                        keyAlias = "tesaauto",
-                        keyStorePassword = { "tesaautopassword".toCharArray() },
-                        privateKeyPassword = { "tesaautopassword".toCharArray() }
+                        keyAlias = keyAlias,
+                        keyStorePassword = { pwd },
+                        privateKeyPassword = { pwd }
                     ) {
                         this.port = this@TeslaEmbeddedServer.sslPort
                         this.host = this@TeslaEmbeddedServer.host
                     }
+
+                    // También abrir en puerto 8081 para compatibilidad total con Taada
+                    if (this@TeslaEmbeddedServer.sslPort != 8081) {
+                        sslConnector(
+                            keyStore = keyStore,
+                            keyAlias = keyAlias,
+                            keyStorePassword = { pwd },
+                            privateKeyPassword = { pwd }
+                        ) {
+                            this.port = 8081
+                            this.host = this@TeslaEmbeddedServer.host
+                        }
+                    }
+
                     isTlsActive = true
-                    Log.i(TAG, "Conector SSL HTTPS habilitado con éxito en puerto ${this@TeslaEmbeddedServer.sslPort}")
+                    Log.i(TAG, "✅ Conectores SSL HTTPS habilitados con éxito en puertos ${this@TeslaEmbeddedServer.sslPort} y 8081 (Let's Encrypt)")
                 } catch (e: Exception) {
                     Log.e(TAG, "Fallo configurando conector SSL HTTPS: ${e.message}", e)
                     isTlsActive = false
@@ -168,13 +217,30 @@ class TeslaEmbeddedServer(
                     get("/status") {
                         val statusJson = JSONObject().apply {
                             put("status", "running")
-                            put("activeClients", activeSessions.size)
+                            put("activeClients", activeClients.size)
                             put("httpPort", port)
                             put("httpsPort", if (isTlsActive) sslPort else null)
                             put("tlsActive", isTlsActive)
                             put("timestamp", System.currentTimeMillis())
                         }
                         call.respondText(statusJson.toString(), ContentType.Application.Json)
+                    }
+
+                    // Endpoint compatible con el frontend de Taada (https://app.taada.top/)
+                    get("/getsocketport") {
+                        val resJson = JSONObject().apply {
+                            put("port", sslPort)
+                            put("resolution", 1) // 1 = 1280x720 (estándar vehicular)
+                            put("width", 1280)
+                            put("height", 720)
+                            put("widthMargin", 0)
+                            put("heightMargin", 0)
+                            put("buildversion", 85) // Requerido >= 73 por app.taada.top para aceptar la app
+                            put("aaHeadunitServerRequired", false)
+                            put("usebt", true)
+                            put("webcodec", true)
+                        }
+                        call.respondText(resJson.toString(), ContentType.Application.Json)
                     }
 
                     // Endpoint de diagnóstico interno detallado
@@ -209,45 +275,13 @@ class TeslaEmbeddedServer(
                         call.respondText(JSONObject().apply { put("home", true) }.toString(), ContentType.Application.Json)
                     }
 
-                    // Canal WebSocket bidireccional
+                    // Canal WebSocket bidireccional (soportando tanto / como /ws para Taada y cliente local)
+                    webSocket("/") {
+                        handleWebSocketSession(this)
+                    }
+
                     webSocket("/ws") {
-                        activeSessions.add(this)
-
-                        try {
-                            // Enviar información inicial de display al cliente
-                            val infoJson = JSONObject().apply {
-                                put("type", "info")
-                                put("width", 1280)
-                                put("height", 720)
-                                put("codec", "h264")
-                            }
-                            send(Frame.Text(infoJson.toString()))
-
-                            // Enviar SPS/PPS inicial de inmediato si ya está disponible en caché para inicializar decodificador
-                            getInitialConfigFrame?.invoke()?.let { spsPps ->
-                                send(Frame.Binary(true, spsPps))
-                            }
-
-                            onClientConnected?.invoke()
-
-                            // Escuchar mensajes entrantes (eventos táctiles y pings)
-                            for (frame in incoming) {
-                                when (frame) {
-                                    is Frame.Text -> {
-                                        val text = frame.readText()
-                                        handleIncomingTextPayload(text, this)
-                                    }
-                                    is Frame.Binary -> {
-                                        // Payloads binarios del cliente si aplica
-                                    }
-                                    else -> Unit
-                                }
-                            }
-                        } catch (e: Exception) {
-                            // Desconexión o error de socket
-                        } finally {
-                            activeSessions.remove(this)
-                        }
+                        handleWebSocketSession(this)
                     }
                 }
             }
@@ -262,40 +296,118 @@ class TeslaEmbeddedServer(
         if (!isRunning) return
         serverEngine?.stop(gracePeriodMillis = 1000, timeoutMillis = 2000)
         serverEngine = null
-        activeSessions.clear()
+        for (client in activeClients) {
+            client.frameChannel.close()
+        }
+        activeClients.clear()
         isRunning = false
     }
 
     /**
      * Emite un frame de video NAL unit en formato binario a todos los clientes web conectados.
+     * Utiliza un canal no bloqueante (DROP_OLDEST) por cliente para garantizar latencia cero
+     * y prevenir cualquier condición de carrera de escritura en Netty / Ktor WebSockets.
      */
     fun broadcastVideoFrame(data: ByteArray) {
-        if (!isRunning || activeSessions.isEmpty()) return
+        if (!isRunning || activeClients.isEmpty()) return
+        for (client in activeClients) {
+            client.frameChannel.trySend(data)
+        }
+    }
 
-        serverScope.launch {
-            val frame = Frame.Binary(true, data)
-            for (session in activeSessions) {
-                try {
-                    session.send(frame)
-                } catch (e: ClosedSendChannelException) {
-                    activeSessions.remove(session)
-                } catch (e: Exception) {
-                    activeSessions.remove(session)
+    private suspend fun handleWebSocketSession(session: WebSocketSession) {
+        val client = ConnectedClient(session)
+        activeClients.add(client)
+
+        // Corutina dedicada exclusivamente a enviar frames de video secuencialmente para este cliente
+        val videoSenderJob = serverScope.launch {
+            try {
+                for (frameBytes in client.frameChannel) {
+                    client.sendFrame(Frame.Binary(true, frameBytes))
+                }
+            } catch (ignored: Exception) {
+            }
+        }
+
+        try {
+            val infoJson = JSONObject().apply {
+                put("type", "info")
+                put("width", 1280)
+                put("height", 720)
+                put("codec", "h264")
+            }
+            client.sendFrame(Frame.Text(infoJson.toString()))
+
+            getInitialConfigFrame?.invoke()?.let { spsPps ->
+                client.sendFrame(Frame.Binary(true, spsPps))
+            }
+
+            onClientConnected?.invoke()
+
+            for (frame in session.incoming) {
+                when (frame) {
+                    is Frame.Text -> {
+                        val text = frame.readText()
+                        handleIncomingTextPayload(text, client)
+                    }
+                    is Frame.Binary -> {
+                        handleIncomingBinaryPayload(frame.readBytes())
+                    }
+                    else -> Unit
                 }
             }
+        } catch (ignored: Exception) {
+        } finally {
+            videoSenderJob.cancel()
+            client.frameChannel.close()
+            activeClients.remove(client)
+        }
+    }
+
+    private fun handleIncomingBinaryPayload(bytes: ByteArray) {
+        if (bytes.size < 8) return
+        try {
+            val actionCode = bytes[0].toInt() and 0xFF
+            val touchesCount = bytes[1].toInt() and 0xFF
+            if (touchesCount > 0 && bytes.size >= 8) {
+                // Formato Big-Endian del BinaryTouchEncoder de Taada:
+                // Byte 0: actionCode (0: DOWN, 1: MOVE, 2: UP, 3: TOUCH)
+                // Byte 1: touchesCount
+                // Bytes 2-3: id
+                // Bytes 4-5: x (coordenada 0 a 1280)
+                // Bytes 6-7: y (coordenada 0 a 720)
+                val x = ((bytes[4].toInt() and 0xFF) shl 8) or (bytes[5].toInt() and 0xFF)
+                val y = ((bytes[6].toInt() and 0xFF) shl 8) or (bytes[7].toInt() and 0xFF)
+                val normX = (x.toDouble() / 1280.0).coerceIn(0.0, 1.0)
+                val normY = (y.toDouble() / 720.0).coerceIn(0.0, 1.0)
+
+                val type = when (actionCode) {
+                    0 -> "pointer_down"
+                    1 -> "pointer_move"
+                    2 -> "pointer_up"
+                    else -> "pointer_down"
+                }
+
+                onTouchEventReceived?.invoke(type, normX, normY, System.currentTimeMillis())
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error procesando touch binario: ${e.message}")
         }
     }
 
     private suspend fun handleIncomingTextPayload(
         text: String,
-        session: WebSocketSession
+        client: ConnectedClient
     ) {
         try {
             val json = JSONObject(text)
             val action = json.optString("action")
             val type = json.optString("type")
 
-            if (action == "launch") {
+            if (action == "START" || action == "REQUEST_KEYFRAME") {
+                Log.d(TAG, "Cliente Taada web solicitó inicio de stream ($action)")
+                onClientConnected?.invoke()
+            } else if (action == "launch") {
                 val pkg = json.optString("package")
                 if (pkg.isNotEmpty()) {
                     safeLaunchApp(pkg)
@@ -319,7 +431,7 @@ class TeslaEmbeddedServer(
                     put("type", "pong")
                     put("t", json.optLong("t"))
                 }
-                session.send(Frame.Text(pongJson.toString()))
+                client.sendFrame(Frame.Text(pongJson.toString()))
             } else if (action == "touch") {
                 val touchType = json.optString("type")
                 val x = json.optDouble("x", 0.0)

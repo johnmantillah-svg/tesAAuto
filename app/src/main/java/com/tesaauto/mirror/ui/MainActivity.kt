@@ -13,6 +13,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.net.VpnService
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -344,7 +345,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun toggleService() {
-        val intent = Intent(this, ProjectionService::class.java)
         try {
             if (isServiceRunning) {
                 if (isBound) {
@@ -353,30 +353,49 @@ class MainActivity : AppCompatActivity() {
                 }
                 projectionService = null
 
-                intent.action = ProjectionService.ACTION_STOP
+                val intent = Intent(this, ProjectionService::class.java).apply {
+                    action = ProjectionService.ACTION_STOP
+                }
                 startService(intent)
                 stopVpnService()
                 isServiceRunning = false
                 updateStatusUi()
             } else {
                 checkAndStartVpn()
-                intent.action = ProjectionService.ACTION_START
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(intent)
-                } else {
-                    startService(intent)
-                }
-                bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
-
-                isServiceRunning = true
-                updateStatusUi()
-                refreshNetworkInfo()
+                
+                // Iniciar directamente el servicio vehicular enlazado al Servidor de Android Auto (127.0.0.1:5277)
+                // Cero diálogos emergentes de captura de pantalla (MediaProjection)
+                startProjectionServiceInternal(Activity.RESULT_CANCELED, null)
             }
         } catch (e: Exception) {
             android.util.Log.e("MainActivity", "Error cambiando estado de servicio", e)
             statusBadge.text = "🔴 ERROR: ${e.localizedMessage}"
             statusBadge.setTextColor(Color.parseColor("#E74C3C"))
             isServiceRunning = false
+        }
+    }
+
+    private fun startProjectionServiceInternal(resultCode: Int, resultData: Intent?) {
+        try {
+            val intent = Intent(this, ProjectionService::class.java).apply {
+                action = ProjectionService.ACTION_START
+                putExtra(ProjectionService.EXTRA_RESULT_CODE, resultCode)
+                if (resultData != null) {
+                    putExtra(ProjectionService.EXTRA_RESULT_DATA, resultData)
+                }
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+            bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+
+            isServiceRunning = true
+            updateStatusUi()
+            refreshNetworkInfo()
+        } catch (e: Exception) {
+            android.util.Log.e("MainActivity", "Error iniciando ProjectionService", e)
         }
     }
 
@@ -411,8 +430,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == REQUEST_CODE_VPN && resultCode == Activity.RESULT_OK) {
-            startVpnService()
+        when (requestCode) {
+            REQUEST_CODE_VPN -> {
+                if (resultCode == Activity.RESULT_OK) {
+                    startVpnService()
+                }
+            }
         }
     }
 
@@ -450,27 +473,23 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshNetworkInfo() {
         val iface = NetworkInterfaceHelper.getHotspotOrWifiIpAddress()
-        val detectedIp = iface?.ipAddress ?: "192.168.43.1"
-        val sslipHost = detectedIp.replace(".", "-") + ".sslip.io"
+        val detectedIp = iface?.ipAddress ?: "10.229.231.100"
 
         val sb = StringBuilder()
-        sb.append("🚗 EN EL NAVEGADOR DEL TESLA:\n")
-        sb.append("http://$sslipHost:8080\n")
-        sb.append("\n🌐 O alternativo GitHub Pages:\n")
+        sb.append("🚗 EN EL NAVEGADOR DEL TESLA (HTTPS Let's Encrypt - Sin alertas):\n")
+        sb.append("https://taada.top:8443\n")
+        sb.append("(o https://app.taada.top)\n\n")
+        sb.append("📱 Conexión Directa Local:\n")
+        sb.append("http://$detectedIp:8080\n")
+        sb.append("https://$detectedIp:8443\n\n")
+        sb.append("🌐 O GitHub Pages:\n")
         sb.append("https://johnmantillah-svg.github.io/tesAAuto/\n")
-
-        if (detectedIp != "0.0.0.0") {
-            sb.append("\n📱 IP Local Móvil: $detectedIp")
-        }
 
         urlText.text = sb.toString().trim()
     }
 
     private fun copyUrlToClipboard() {
-        val iface = NetworkInterfaceHelper.getHotspotOrWifiIpAddress()
-        val detectedIp = iface?.ipAddress ?: "192.168.43.1"
-        val sslipHost = detectedIp.replace(".", "-") + ".sslip.io"
-        val url = "http://$sslipHost:8080"
+        val url = "https://taada.top:8443"
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboard.setPrimaryClip(ClipData.newPlainText("TesAAuto URL", url))
         Toast.makeText(this, "Dirección copiada: $url", Toast.LENGTH_SHORT).show()
@@ -478,6 +497,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun openAndroidAutoSettings() {
         try {
+            com.tesaauto.mirror.service.TouchAccessibilityService.isAutoStartingHeadUnit = true
             val intent = Intent().apply {
                 component = ComponentName(
                     "com.google.android.projection.gearhead",
@@ -486,7 +506,7 @@ class MainActivity : AppCompatActivity() {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK
             }
             startActivity(intent)
-            Toast.makeText(this, "Toca ⋮ arriba a la derecha y pulsa 'Iniciar servidor unidad princ.'", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Iniciando Servidor de Android Auto...", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(this, "No se pudo abrir Android Auto: ${e.message}", Toast.LENGTH_LONG).show()
         }

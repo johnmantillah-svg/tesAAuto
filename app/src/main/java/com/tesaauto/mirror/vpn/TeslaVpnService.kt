@@ -10,8 +10,9 @@ class TeslaVpnService : VpnService() {
 
     companion object {
         const val TAG = "TeslaVpnService"
-        const val VPN_IP = "100.99.9.9"
-        const val VPN_PREFIX = 24
+        const val VPN_IP = "51.75.29.16" // taada.top IP
+        const val VPN_IP_FALLBACK = "7.7.7.7"
+        const val VPN_PREFIX = 32
         const val ACTION_START = "com.tesaauto.mirror.vpn.START"
         const val ACTION_STOP = "com.tesaauto.mirror.vpn.STOP"
 
@@ -43,12 +44,15 @@ class TeslaVpnService : VpnService() {
                 .setSession("TesAAuto")
                 .addAddress(VPN_IP, VPN_PREFIX)
                 .addRoute(VPN_IP, 32)
+                .addAddress(VPN_IP_FALLBACK, 32)
+                .addRoute(VPN_IP_FALLBACK, 32)
+                .addDisallowedApplication(packageName)
                 .setMtu(1500)
                 .setBlocking(false)
 
             vpnInterface = builder.establish()
             isRunning = true
-            Log.i(TAG, "✅ TeslaVpnService establecido con IP virtual $VPN_IP")
+            Log.i(TAG, "✅ TeslaVpnService establecido con IP virtual $VPN_IP (taada.top) y $VPN_IP_FALLBACK")
 
             // Hilo ligero para drenar el buffer de entrada del túnel y evitar acumulación
             vpnThread = Thread({

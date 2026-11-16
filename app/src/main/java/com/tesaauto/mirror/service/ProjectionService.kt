@@ -1,5 +1,6 @@
 package com.tesaauto.mirror.service
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,11 +11,17 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.net.wifi.WifiManager
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
-import android.net.wifi.WifiManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.tesaauto.mirror.aa.AndroidAutoHeadUnitClient
@@ -35,6 +42,8 @@ class ProjectionService : Service() {
 
         const val ACTION_START = "com.tesaauto.mirror.ACTION_START"
         const val ACTION_STOP = "com.tesaauto.mirror.ACTION_STOP"
+        const val EXTRA_RESULT_CODE = "extra_result_code"
+        const val EXTRA_RESULT_DATA = "extra_result_data"
     }
 
     private val binder = LocalBinder()
@@ -51,6 +60,10 @@ class ProjectionService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var isScreenReceiverRegistered = false
+
+    private var mediaProjection: MediaProjection? = null
+    private var mediaProjectionCallback: MediaProjection.Callback? = null
+    private var screenVirtualDisplay: VirtualDisplay? = null
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -92,15 +105,29 @@ class ProjectionService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startProjectionServer()
+            ACTION_START -> {
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                val resultData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                }
+                startProjectionServer(resultCode, resultData)
+            }
             ACTION_STOP -> stopProjectionServer()
         }
         return START_STICKY
     }
 
-    private fun startProjectionServer() {
-        if (embeddedServer?.isRunning == true && aaClient != null) {
+    private fun startProjectionServer(resultCode: Int = Activity.RESULT_CANCELED, resultData: Intent? = null) {
+        val hasMediaProjection = (resultCode == Activity.RESULT_OK && resultData != null)
+
+        if (embeddedServer?.isRunning == true) {
             Log.i(TAG, "startProjectionServer: El servidor ya está en ejecución activa")
+            if (hasMediaProjection && mediaProjection == null) {
+                initMediaProjection(resultCode, resultData!!)
+            }
             return
         }
 
@@ -144,9 +171,23 @@ class ProjectionService : Service() {
 
             val notification = createNotification("Servidor vehicular activo en http://$currentServerIp:8080")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+                var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                if (hasMediaProjection) {
+                    types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                }
+                startForeground(NOTIFICATION_ID, notification, types)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                if (hasMediaProjection) {
+                    types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+                }
+                startForeground(NOTIFICATION_ID, notification, types)
             } else {
                 startForeground(NOTIFICATION_ID, notification)
+            }
+
+            if (hasMediaProjection && mediaProjection == null) {
+                initMediaProjection(resultCode, resultData!!)
             }
 
             // 1. Iniciar servidor embebido Ktor CIO con enrutamiento de eventos táctiles si no está corriendo
@@ -157,14 +198,15 @@ class ProjectionService : Service() {
                         host = "0.0.0.0",
                         port = 8080,
                         onClientConnected = {
-                            Log.i(TAG, "Tesla browser conectado vía WebSocket. Asertando VideoFocus a Android Auto...")
+                            Log.i(TAG, "Tesla browser conectado vía WebSocket. Asertando VideoFocus y SyncFrame...")
+                            videoEncoderPipeline?.requestSyncFrame()
                             aaClient?.requestVideoFocus(projected = true, force = true)
                         },
-                        onTouchEventReceived = { type, x, y, ts ->
+                        onTouchEventReceived = { type, x, y, _ ->
                             if (aaClient?.isConnected == true) {
                                 aaClient?.sendTouchEvent(type, x, y)
                             } else {
-                                touchInputManager?.processTouchEvent(type, x, y, ts)
+                                Log.w(TAG, "Touch vehicular ignorado: Android Auto no está conectado aún")
                             }
                         }
                     ).apply {
@@ -172,38 +214,46 @@ class ProjectionService : Service() {
                             aaClient?.cachedSpsPps ?: videoEncoderPipeline?.cachedSpsPps
                         }
                         onHomeRequest = {
-                            if (aaClient?.isConnected != true) {
-                                virtualDisplayManager?.showPresentation()
-                                touchInputManager?.injectKeyEvent(3)
+                            if (aaClient?.isConnected == true) {
+                                Log.i(TAG, "Home vehicular en Android Auto")
                             }
                         }
                         onLaunchAppRequest = { pkg ->
                             if (aaClient?.isConnected == true) {
-                                Log.i(TAG, "Lanzamiento vehicular solicitado para $pkg bajo Android Auto")
+                                Log.i(TAG, "Android Auto conectado: la selección de aplicaciones ($pkg) se realiza dentro de la barra vehicular Coolwalk")
                                 true
                             } else {
-                                virtualDisplayManager?.launchApplicationOnDisplay(pkg) ?: false
+                                Log.w(TAG, "Lanzamiento de $pkg denegado: Servidor Android Auto no conectado")
+                                false
                             }
                         }
                         onTapRequest = { x, y ->
                             if (aaClient?.isConnected == true) {
+                                // MODO ANDROID AUTO: El toque va DIRECTO al canal vehicular de Gearhead sin tocar la pantalla física del teléfono
                                 aaClient?.sendTouchEvent("down", x, y)
                                 aaClient?.sendTouchEvent("up", x, y)
                             } else {
-                                touchInputManager?.injectTap(x, y)
+                                Log.w(TAG, "Tap vehicular ignorado: Android Auto no conectado")
                             }
                         }
-                        onSwipeRequest = { x1, y1, x2, y2, dur ->
+                        onSwipeRequest = { x1, y1, x2, y2, _ ->
                             if (aaClient?.isConnected == true) {
+                                // MODO ANDROID AUTO: El swipe va DIRECTO al canal vehicular
                                 aaClient?.sendTouchEvent("down", x1, y1)
                                 aaClient?.sendTouchEvent("move", x2, y2)
                                 aaClient?.sendTouchEvent("up", x2, y2)
                             } else {
-                                touchInputManager?.injectSwipe(x1, y1, x2, y2, dur)
+                                Log.w(TAG, "Swipe vehicular ignorado: Android Auto no conectado")
                             }
                         }
                         onKeyRequest = { code ->
-                            touchInputManager?.injectKeyEvent(code)
+                            if (code == 4 && TouchAccessibilityService.isServiceRunning) {
+                                TouchAccessibilityService.back()
+                            } else if (code == 3 && TouchAccessibilityService.isServiceRunning) {
+                                TouchAccessibilityService.home()
+                            } else {
+                                touchInputManager?.injectKeyEvent(code)
+                            }
                         }
                         onGetStatusRequest = {
                             org.json.JSONObject().apply {
@@ -279,6 +329,8 @@ class ProjectionService : Service() {
             } catch (ignored: Exception) {}
             wakeLock = null
 
+            stopScreenCapture()
+
             touchInputManager?.release()
             touchInputManager = null
 
@@ -306,6 +358,78 @@ class ProjectionService : Service() {
     override fun onDestroy() {
         stopProjectionServer()
         super.onDestroy()
+    }
+
+    private fun initMediaProjection(resultCode: Int, resultData: Intent) {
+        try {
+            val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            mediaProjection = mpManager.getMediaProjection(resultCode, resultData)
+            mediaProjectionCallback = object : MediaProjection.Callback() {
+                override fun onStop() {
+                    Log.i(TAG, "MediaProjection detenido por el sistema")
+                    stopScreenCapture()
+                }
+            }
+            mediaProjection?.registerCallback(mediaProjectionCallback!!, Handler(Looper.getMainLooper()))
+            startScreenCapture()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error inicializando MediaProjection: ${e.message}", e)
+        }
+    }
+
+    private fun startScreenCapture() {
+        val mp = mediaProjection ?: return
+        try {
+            val metrics = resources.displayMetrics
+            val width = 1280
+            val height = 720
+            val density = metrics.densityDpi
+
+            if (videoEncoderPipeline == null) {
+                videoEncoderPipeline = VideoEncoderPipeline(
+                    config = VideoEncoderPipeline.EncoderConfig(
+                        width = width,
+                        height = height,
+                        bitrate = 3_500_000,
+                        frameRate = 60,
+                        mimeType = VideoEncoderPipeline.MIME_H264
+                    ),
+                    onFrameEncoded = { nalBytes, isKeyFrame ->
+                        embeddedServer?.broadcastVideoFrame(nalBytes)
+                    }
+                )
+            }
+            val surface = videoEncoderPipeline?.start()
+            if (surface != null) {
+                screenVirtualDisplay = mp.createVirtualDisplay(
+                    "TesAAutoScreenMirror",
+                    width,
+                    height,
+                    density,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    surface,
+                    null,
+                    null
+                )
+                Log.i(TAG, "✅ Screen Mirroring activo vía MediaProjection: ${width}x${height} @ 60 FPS")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error iniciando captura de pantalla con MediaProjection", e)
+        }
+    }
+
+    private fun stopScreenCapture() {
+        try {
+            screenVirtualDisplay?.release()
+            screenVirtualDisplay = null
+            videoEncoderPipeline?.stop()
+            videoEncoderPipeline = null
+            mediaProjection?.stop()
+            mediaProjection = null
+            Log.i(TAG, "Screen Mirroring detenido y recursos liberados")
+        } catch (e: Exception) {
+            Log.w(TAG, "Error liberando captura de pantalla: ${e.message}")
+        }
     }
 
     private fun createNotificationChannel() {

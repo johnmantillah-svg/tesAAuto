@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TesAAuto Mirror</string>
+    <string name="accessibility_service_description">Permite el control táctil bidireccional desde la pantalla de Tesla hacia tu teléfono.</string>
+</resources>

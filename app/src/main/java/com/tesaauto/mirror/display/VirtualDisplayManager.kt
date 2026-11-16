@@ -154,44 +154,48 @@ class VirtualDisplayManager(
     }
 
     /**
-     * Lanza una aplicación (ej. Waze, Google Maps) en el VirtualDisplay secundario.
+     * Lanza una aplicación (ej. Waze, Google Maps) en el VirtualDisplay secundario o en pantalla principal.
      */
     fun launchApplicationOnDisplay(packageName: String, activityClass: String? = null, displayId: Int = currentDisplayId): Boolean {
-        if (displayId == Display.DEFAULT_DISPLAY) {
-            Log.w(TAG, "No se puede lanzar en display secundario: DisplayID no válido")
-            return false
-        }
-
         // Ocultar la presentación de reloj/dashboard para dejar libre el display a la app
         dismissPresentation()
 
         try {
-            val intent = if (packageName == "com.waze") {
+            val pm = context.packageManager
+            val intent = pm.getLaunchIntentForPackage(packageName)?.apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+            } ?: if (packageName == "com.waze") {
                 Intent().apply {
                     component = ComponentName("com.waze", "com.waze.FreeMapAppActivity")
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
                 }
             } else if (activityClass != null) {
                 Intent().apply {
                     component = ComponentName(packageName, activityClass)
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
                 }
             } else {
-                context.packageManager.getLaunchIntentForPackage(packageName)?.apply {
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
-                }
+                null
             }
 
-            if (intent != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (intent == null) {
+                Log.w(TAG, "No se encontró intent de lanzamiento para $packageName")
+                return false
+            }
+
+            if (displayId != Display.DEFAULT_DISPLAY && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val options = ActivityOptions.makeBasic().apply {
                     setLaunchDisplayId(displayId)
                 }
                 context.startActivity(intent, options.toBundle())
                 Log.i(TAG, "Aplicación $packageName lanzada mediante ActivityOptions en DisplayID=$displayId")
-                return true
+            } else {
+                context.startActivity(intent)
+                Log.i(TAG, "Aplicación $packageName lanzada directamente en pantalla principal")
             }
+            return true
         } catch (e: Exception) {
-            Log.e(TAG, "Fallo al lanzar vía ActivityOptions", e)
+            Log.e(TAG, "Fallo al lanzar app $packageName", e)
         }
 
         return false
